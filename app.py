@@ -6,7 +6,7 @@ import sqlite3
 import time
 
 import tinytuya
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
@@ -20,7 +20,9 @@ API_SECRET = os.environ["TUYA_ACCESS_SECRET"]
 DEVICE_ID = os.environ["TUYA_DEVICE_ID"]
 
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
+CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])  # личный чат: управление кнопками
+# Куда слать уведомления и автоотчёты (например, канал). Пусто = в личный чат.
+NOTIFY_CHAT_ID = int(os.environ.get("NOTIFY_CHAT_ID") or CHAT_ID)
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
 REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "0"))  # 0 = без автоотчётов
@@ -250,7 +252,10 @@ sent_alerts = {}  # key -> время последнего уведомлени�
 
 async def notify(text):
     try:
-        await bot.send_message(CHAT_ID, text, reply_markup=KEYBOARD)
+        if NOTIFY_CHAT_ID == CHAT_ID:
+            await bot.send_message(CHAT_ID, text, reply_markup=KEYBOARD)
+        else:
+            await bot.send_message(NOTIFY_CHAT_ID, text)
     except Exception:
         log.exception("не удалось отправить уведомление")
 
@@ -376,7 +381,24 @@ async def health_cmd(m: Message):
     await m.answer(fmt_health(online), reply_markup=KEYBOARD)
 
 
+# Запасной обработчик: срабатывает, только если сообщение не от владельца.
+fallback = Router()
+
+
+@fallback.message()
+async def unknown_chat(m: Message):
+    log.warning(
+        "Сообщение из чужого чата: chat.id=%s chat.type=%s user.id=%s (ожидался TELEGRAM_CHAT_ID=%s)",
+        m.chat.id, m.chat.type, m.from_user.id if m.from_user else None, CHAT_ID,
+    )
+    await m.answer(f"Доступ закрыт. id этого чата: {m.chat.id}\nОжидается: {CHAT_ID}")
+
+
+dp.include_router(fallback)
+
+
 async def main():
+    log.info("Старт. Владелец chat_id=%s, уведомления в %s", CHAT_ID, NOTIFY_CHAT_ID)
     asyncio.create_task(poll_loop())
     await dp.start_polling(bot)
 
