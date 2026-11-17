@@ -6,8 +6,8 @@ import sqlite3
 import time
 
 import tinytuya
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -75,10 +75,72 @@ tuya_lock = asyncio.Lock()
 
 
 def _get_status_sync():
+    """Пробует три источника: /status, данные устройства, shadow properties."""
+    errors = []
+
+    # 1. стандартный статус
     res = cloud.getstatus(DEVICE_ID)
-    if not res or not res.get("success"):
-        raise RuntimeError(f"Tuya API error: {res}")
-    return {i["code"]: i["value"] for i in res["result"]}
+    if res and res.get("success"):
+        status = {i["code"]: i["value"] for i in (res.get("result") or [])}
+        if status:
+            return status
+    else:
+        errors.append(f"status: {res}")
+
+    # 2. карточка устройства (там тоже есть список status)
+    res = cloud.cloudrequest(f"/v1.0/devices/{DEVICE_ID}")
+    if res and res.get("success"):
+        status = {i["code"]: i["value"] for i in ((res.get("result") or {}).get("status") or [])}
+        if status:
+            return status
+    else:
+        errors.append(f"device: {res}")
+
+    # 3. shadow properties (новые устройства, модель «thing»)
+    res = cloud.cloudrequest(f"/v2.0/cloud/thing/{DEVICE_ID}/shadow/properties")
+    if res and res.get("success"):
+        props = (res.get("result") or {}).get("properties") or []
+        status = {p.get("code") or str(p.get("dp_id")): p.get("value") for p in props}
+        if status:
+            return status
+    else:
+        errors.append(f"shadow: {res}")
+
+    if len(errors) == 3:
+        raise RuntimeError("Tuya API error: " + " | ".join(errors))
+    return {}
+
+
+SECRET_KEYS = {"local_key", "uid", "ip", "lat", "lon", "owner_id", "sn", "uuid", "mac", "time_zone"}
+
+
+def _scrub(obj):
+    """Убирает секретные и личные поля перед отправкой в чат."""
+    if isinstance(obj, dict):
+        return {k: _scrub(v) for k, v in obj.items() if k not in SECRET_KEYS}
+    if isinstance(obj, list):
+        return [_scrub(v) for v in obj]
+    return obj
+
+
+def _diag_sync():
+    out = {}
+    for name, url in [
+        ("device", f"/v1.0/devices/{DEVICE_ID}"),
+        ("status", f"/v1.0/devices/{DEVICE_ID}/status"),
+        ("specifications", f"/v1.0/devices/{DEVICE_ID}/specifications"),
+        ("shadow", f"/v2.0/cloud/thing/{DEVICE_ID}/shadow/properties"),
+    ]:
+        try:
+            out[name] = _scrub(cloud.cloudrequest(url))
+        except Exception as e:
+            out[name] = f"ошибка: {e}"
+    return out
+
+
+async def get_diag():
+    async with tuya_lock:
+        return await asyncio.to_thread(_diag_sync)
 
 
 async def get_status():
@@ -235,12 +297,31 @@ async def day(m: Message):
     await m.answer(fmt_day(), reply_markup=KEYBOARD)
 
 
+async def answer_long(m: Message, text: str):
+    """Telegram ограничивает сообщение 4096 символами."""
+    for i in range(0, len(text), 3500):
+        await m.answer(text[i : i + 3500], reply_markup=KEYBOARD)
+
+
 @dp.message(F.text == BTN_RAW)
 async def raw(m: Message):
     try:
-        await m.answer(fmt_raw(await get_status()), reply_markup=KEYBOARD)
+        status = await get_status()
+        await answer_long(m, fmt_raw(status))
+        if not status:
+            await m.answer("DP пустые, присылаю диагностику...")
+            await answer_long(m, "🧪 Диагностика:\n" + json.dumps(await get_diag(), ensure_ascii=False, indent=1))
     except Exception as e:
         log.exception("raw")
+        await m.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("diag"))
+async def diag(m: Message):
+    try:
+        await answer_long(m, "🧪 Диагностика:\n" + json.dumps(await get_diag(), ensure_ascii=False, indent=1))
+    except Exception as e:
+        log.exception("diag")
         await m.answer(f"Ошибка: {e}")
 
 
@@ -380,6 +461,26 @@ async def health_cmd(m: Message):
         online = None
     await m.answer(fmt_health(online), reply_markup=KEYBOARD)
 
+
+class UpdateLogger(BaseMiddleware):
+    """Пишет в лог тип каждого обновления и чат, из которого оно пришло."""
+
+    async def __call__(self, handler, event, data):
+        try:
+            inner = getattr(event, event.event_type, None)
+            chat = getattr(inner, "chat", None)
+            log.info(
+                "Обновление: type=%s chat.id=%s chat.type=%s",
+                event.event_type,
+                getattr(chat, "id", None),
+                getattr(chat, "type", None),
+            )
+        except Exception:
+            log.exception("UpdateLogger")
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(UpdateLogger())
 
 # Запасной обработчик: срабатывает, только если сообщение не от владельца.
 fallback = Router()
