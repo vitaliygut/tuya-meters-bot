@@ -61,6 +61,44 @@ def parse_sensors(raw):
 
 SENSORS = parse_sensors(os.environ.get("SENSORS", ""))
 
+
+def parse_value(raw):
+    """Строка из .env -> значение DP: true/false, null, число или текст."""
+    low = raw.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "none", ""):
+        return None
+    try:
+        return int(low)
+    except ValueError:
+        pass
+    try:
+        return float(low)
+    except ValueError:
+        return raw.strip()
+
+
+def parse_watch(raw):
+    """code:Название:норма,code2:Название2:норма2"""
+    out = []
+    for part in filter(None, (p.strip() for p in raw.split(","))):
+        it = part.split(":")
+        out.append((it[0], it[1] if len(it) > 1 else it[0], parse_value(it[2]) if len(it) > 2 else None))
+    return out
+
+
+# DP, за которыми следим на предмет протечки/срабатывания защиты. Норма = как при штатной работе.
+DEFAULT_WATCH = (
+    "status_wire_line:Проводные датчики:0,"
+    "status_rf_sensor:Беспроводные датчики:null,"
+    "notifications:Уведомления Neptun:0,"
+    "status_crane_group_1:Кран группа 1:true,"
+    "status_crane_group_2:Кран группа 2:true"
+)
+LEAK_WATCH = parse_watch(os.environ.get("LEAK_WATCH", DEFAULT_WATCH))
+LEAK_REPEAT_MINUTES = float(os.environ.get("LEAK_REPEAT_MINUTES", "30"))
+
 # --- кнопки ------------------------------------------------------------
 BTN_NOW = "📊 Показания"
 BTN_RAW = "🔧 Все DP"
@@ -380,11 +418,13 @@ async def maybe_send_monthly():
         log.info("Ежемесячный отчёт отправлен")
 
 
-async def raise_alert(key, text):
-    """Шлёт уведомление один раз и повторяет не чаще ALERT_REPEAT_HOURS."""
+async def raise_alert(key, text, repeat=None):
+    """Шлёт уведомление один раз и повторяет не чаще repeat секунд (по умолчанию ALERT_REPEAT_HOURS)."""
     now = time.time()
     last = sent_alerts.get(key)
-    if last is None or now - last >= ALERT_REPEAT_HOURS * 3600:
+    if repeat is None:
+        repeat = ALERT_REPEAT_HOURS * 3600
+    if last is None or now - last >= repeat:
         sent_alerts[key] = now
         await notify(text)
 
@@ -393,6 +433,27 @@ async def clear_alert(key, text):
     if key in sent_alerts:
         del sent_alerts[key]
         await notify(text)
+
+
+def fmt_val(v):
+    return json.dumps(v, ensure_ascii=False)
+
+
+async def check_leaks(status):
+    for code, name, norm in LEAK_WATCH:
+        if code not in status:
+            continue
+        value = status[code]
+        key = f"leak:{code}"
+        if value != norm:
+            await raise_alert(
+                key,
+                f"🚨 {name}: {fmt_val(value)} (в норме {fmt_val(norm)}).\n"
+                "Возможна протечка или сработала защита. Проверьте датчики и краны!",
+                repeat=LEAK_REPEAT_MINUTES * 60,
+            )
+        else:
+            await clear_alert(key, f"✅ {name}: снова в норме ({fmt_val(value)}).")
 
 
 def fmt_health(online):
@@ -453,6 +514,7 @@ async def poll_once():
             health["offline_since"] = None
             await clear_alert("offline", "🟢 Устройство снова онлайн.")
         save_readings(status)
+        await check_leaks(status)
 
     # 3. свежесть данных
     if SENSORS:
