@@ -1,6 +1,10 @@
 services:
-  neptun:
+  tuya-meters-bot:
     build: .
-    container_name: neptun-tuya
+    container_name: tuya-meters-bot
     restart: unless-stopped
     env_file: .env
+    environment:
+      - TZ=${TZ:-Europe/Belgrade}
+    volumes:
+      - ./data:/data

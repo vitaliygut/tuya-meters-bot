@@ -1,9 +1,11 @@
 import asyncio
+import calendar
 import json
 import logging
 import os
 import sqlite3
 import time
+from datetime import datetime
 
 import tinytuya
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -27,6 +29,10 @@ NOTIFY_CHAT_ID = int(os.environ.get("NOTIFY_CHAT_ID") or CHAT_ID)
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
 REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "0"))  # 0 = без автоотчётов
 DB_PATH = os.environ.get("DB_PATH", "/data/readings.db")
+
+# ежемесячный отчёт: числа месяца (0 = выключен) и час по времени TZ
+MONTHLY_REPORT_DAY = int(os.environ.get("MONTHLY_REPORT_DAY", "0"))
+MONTHLY_REPORT_HOUR = int(os.environ.get("MONTHLY_REPORT_HOUR", "9"))
 
 # мониторинг и уведомления
 NO_DATA_ALERT_HOURS = float(os.environ.get("NO_DATA_ALERT_HOURS", "48"))      # нет новых показаний
@@ -57,13 +63,12 @@ SENSORS = parse_sensors(os.environ.get("SENSORS", ""))
 
 # --- кнопки ------------------------------------------------------------
 BTN_NOW = "📊 Показания"
-BTN_DAY = "📈 За 24 часа"
 BTN_RAW = "🔧 Все DP"
 BTN_HEALTH = "🩺 Состояние"
 
 KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_NOW), KeyboardButton(text=BTN_DAY)],
+        [KeyboardButton(text=BTN_NOW)],
         [KeyboardButton(text=BTN_HEALTH), KeyboardButton(text=BTN_RAW)],
     ],
     resize_keyboard=True,
@@ -166,7 +171,19 @@ def db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS readings (ts INTEGER, code TEXT, value REAL)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_code_ts ON readings (code, ts)")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     return conn
+
+
+def meta_get(key):
+    with db() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def meta_set(key, value):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
 
 def save_readings(status):
@@ -180,20 +197,6 @@ def save_readings(status):
     if rows:
         with db() as conn:
             conn.executemany("INSERT INTO readings VALUES (?,?,?)", rows)
-
-
-def delta_24h(code):
-    since = int(time.time()) - 86400
-    with db() as conn:
-        first = conn.execute(
-            "SELECT value FROM readings WHERE code=? AND ts>=? ORDER BY ts ASC LIMIT 1", (code, since)
-        ).fetchone()
-        last = conn.execute(
-            "SELECT value FROM readings WHERE code=? ORDER BY ts DESC LIMIT 1", (code,)
-        ).fetchone()
-    if not first or not last:
-        return None
-    return last[0] - first[0]
 
 
 def last_reading_ts():
@@ -239,17 +242,6 @@ def fmt_now(status):
     return "\n".join(lines)
 
 
-def fmt_day():
-    if not SENSORS:
-        return "SENSORS не задан в .env."
-    lines = ["📈 Расход за 24 часа:"]
-    for code, name, scale, unit in SENSORS:
-        d = delta_24h(code)
-        lines.append(f"{name}: нет данных" if d is None else f"{name}: {d * scale:.3f} {unit}".strip())
-    lines.append("\n(считается по накопленной истории, сразу после запуска данных мало)")
-    return "\n".join(lines)
-
-
 def fmt_dur(seconds):
     seconds = int(seconds)
     d, rem = divmod(seconds, 86400)
@@ -292,11 +284,6 @@ async def now(m: Message):
         await m.answer(f"Ошибка: {e}")
 
 
-@dp.message(F.text == BTN_DAY)
-async def day(m: Message):
-    await m.answer(fmt_day(), reply_markup=KEYBOARD)
-
-
 async def answer_long(m: Message, text: str):
     """Telegram ограничивает сообщение 4096 символами."""
     for i in range(0, len(text), 3500):
@@ -337,8 +324,60 @@ async def notify(text):
             await bot.send_message(CHAT_ID, text, reply_markup=KEYBOARD)
         else:
             await bot.send_message(NOTIFY_CHAT_ID, text)
+        return True
     except Exception:
         log.exception("не удалось отправить уведомление")
+        return False
+
+
+def monthly_due(now):
+    """Пора ли слать ежемесячный отчёт. В коротких месяцах день сдвигается на последний."""
+    if not MONTHLY_REPORT_DAY or not SENSORS:
+        return False
+    day = min(MONTHLY_REPORT_DAY, calendar.monthrange(now.year, now.month)[1])
+    if (now.day, now.hour) < (day, MONTHLY_REPORT_HOUR):
+        return False
+    return meta_get("monthly_last") != now.strftime("%Y-%m")
+
+
+def fmt_monthly(status, prev, prev_date, now):
+    lines = [f"🗓 Показания на {now:%d.%m.%Y}:"]
+    for code, name, scale, unit in SENSORS:
+        if code not in status:
+            lines.append(f"{name}: нет данных ({code})")
+            continue
+        try:
+            value = float(status[code])
+        except (TypeError, ValueError):
+            lines.append(f"{name}: {status[code]}")
+            continue
+        line = f"{name}: {value * scale:.3f} {unit}".strip()
+        if prev and code in prev:
+            line += f" (+{(value - prev[code]) * scale:.3f} {unit} с {prev_date})".replace("  ", " ")
+        lines.append(line)
+    if not prev:
+        lines.append("\nЭто первый ежемесячный отчёт, расход появится со следующего.")
+    return "\n".join(lines)
+
+
+async def maybe_send_monthly():
+    now = datetime.now()
+    if not monthly_due(now):
+        return
+    status = await get_status()
+    prev = json.loads(meta_get("monthly_snapshot") or "null")
+    prev_date = meta_get("monthly_snapshot_date") or ""
+    if await notify(fmt_monthly(status, prev, prev_date, now)):
+        snapshot = {}
+        for code, *_ in SENSORS:
+            try:
+                snapshot[code] = float(status[code])
+            except (KeyError, TypeError, ValueError):
+                pass
+        meta_set("monthly_snapshot", json.dumps(snapshot))
+        meta_set("monthly_snapshot_date", now.strftime("%d.%m.%Y"))
+        meta_set("monthly_last", now.strftime("%Y-%m"))
+        log.info("Ежемесячный отчёт отправлен")
 
 
 async def raise_alert(key, text):
@@ -366,6 +405,8 @@ def fmt_health(online):
     if SENSORS:
         lines.append(f"Последнее изменение показаний: {fmt_ts(last_change_ts())}")
     lines.append(f"Опрос каждые {fmt_dur(POLL_INTERVAL)}")
+    if MONTHLY_REPORT_DAY:
+        lines.append(f"Ежемесячный отчёт: {MONTHLY_REPORT_DAY} числа в {MONTHLY_REPORT_HOUR:02d}:00")
     if sent_alerts:
         lines.append("⚠️ Активные проблемы: " + ", ".join(sorted(sent_alerts)))
     else:
@@ -445,6 +486,8 @@ async def poll_loop():
         ok = False
         try:
             ok = await poll_once()
+            if ok:
+                await maybe_send_monthly()
             if ok and REPORT_INTERVAL and time.time() - last_report >= REPORT_INTERVAL:
                 await notify(fmt_now(await get_status()))
                 last_report = time.time()
