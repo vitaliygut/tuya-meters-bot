@@ -1,0 +1,6 @@
+services:
+  neptun:
+    build: .
+    container_name: neptun-tuya
+    restart: unless-stopped
+    env_file: .env
