@@ -330,7 +330,7 @@ def _diag_sync():
 
 
 # --- локальный доступ (алерты) --------------------------------------------
-_local = {"dev": None, "version": None, "key_fetched": 0.0}
+_local = {"dev": None, "version": None, "variant": None, "key_fetched": 0.0}
 local_state = {"ts": None, "dps": None, "fail_since": None, "fails": 0, "error": None}
 
 
@@ -348,14 +348,40 @@ def _get_local_key_sync():
     return LOCAL_KEY_ENV or meta_get("local_key") or _refresh_local_key_sync()
 
 
-def _make_device(version, key):
-    d = tinytuya.Device(DEVICE_ID, LOCAL_IP, key, version=float(version))
+def _make_device(version, key, dev_type="default"):
+    d = tinytuya.Device(DEVICE_ID, LOCAL_IP, key, dev_type=dev_type, version=float(version))
     for name, arg in (("set_socketTimeout", 5), ("set_socketRetryLimit", 1)):
         try:
             getattr(d, name)(arg)
         except Exception:
             pass
+    if dev_type == "device22":
+        # устройствам device22 нужно явно сказать, какие DP спрашивать: берём id из облачного соответствия
+        ids = list(load_dp_map().values())
+        if ids:
+            try:
+                d.set_dpsUsed({str(i): None for i in ids})
+            except Exception:
+                pass
     return d
+
+
+def _variants():
+    """(версия протокола, тип устройства) в порядке проверки. Для 22-символьных ID сначала device22."""
+    versions = [LOCAL_VERSION] if LOCAL_VERSION != "auto" else ["3.4", "3.3", "3.5", "3.2"]
+    out = []
+    for v in versions:
+        out.append((v, "default"))
+        if float(v) < 3.4:
+            out.append((v, "device22"))
+    if len(DEVICE_ID) == 22:
+        out.sort(key=lambda x: x[1] != "device22")  # device22 вперёд, порядок остальных сохраняется
+    return out
+
+
+def _variant_label(variant):
+    v, t = variant
+    return v if t == "default" else f"{v} ({t})"
 
 
 _local_lock = threading.Lock()
@@ -369,21 +395,16 @@ def _local_status_sync():
 def _local_status_locked():
     key = _get_local_key_sync()
     if _local["dev"] is None:
-        if _local["version"]:
-            versions = [_local["version"]]
-        elif LOCAL_VERSION != "auto":
-            versions = [LOCAL_VERSION]
-        else:
-            versions = ["3.4", "3.3", "3.5", "3.2"]
+        variants = [_local["variant"]] if _local["variant"] else _variants()
         errors = []
-        for v in versions:
-            d = _make_device(v, key)
+        for variant in variants:
+            d = _make_device(variant[0], key, variant[1])
             res = d.status()
             if res and "dps" in res:
-                _local.update(dev=d, version=v)
-                log.info("Локальное подключение: %s, протокол %s", LOCAL_IP, v)
+                _local.update(dev=d, variant=variant, version=_variant_label(variant))
+                log.info("Локальное подключение: %s, протокол %s", LOCAL_IP, _local["version"])
                 return res["dps"]
-            errors.append(f"{v}: {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+            errors.append(f"{_variant_label(variant)}: {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
         raise RuntimeError("локальный опрос не удался: " + "; ".join(errors))
     res = _local["dev"].status()
     if not res or "dps" not in res:
@@ -406,35 +427,47 @@ def _lan_diag_sync():
         except OSError as e:
             out.append(f"1) TCP {LOCAL_IP}:6668: ❌ {e}")
             out.append("Устройство не отвечает по сети: проверьте IP в роутере, что устройство и бот в одной подсети, "
-                       "что модуль не в режиме сна/выключен, и что другое приложение не держит соединение.")
+                       "что модуль включён, и что другое приложение не держит соединение.")
             return out
         # 2. ключ
         try:
             key = _get_local_key_sync()
-            out.append(f"2) local key: {'из .env' if LOCAL_KEY_ENV else 'из облака'}, длина {len(key)} (должно быть 16)")
+            src = "из .env" if LOCAL_KEY_ENV else "из облака"
+            out.append(f"2) local key: {src}, длина {len(key)} (должно быть 16)")
+            if len(key) != 16:
+                out.append("⚠️ Длина ключа не 16: в .env символ $ нужно брать в одинарные кавычки, "
+                           "например TUYA_LOCAL_KEY='abc$def...'. Либо оставьте TUYA_LOCAL_KEY пустым.")
         except Exception as e:
             out.append(f"2) local key: ❌ {e}")
             return out
-        # 3. все версии протокола
+        out.append(f"   ID устройства: {len(DEVICE_ID)} символов" + (" (тип device22)" if len(DEVICE_ID) == 22 else ""))
+        # 3. все варианты протокола
         working = []
-        for v in ("3.5", "3.4", "3.3", "3.2", "3.1"):
+        all_variants = [(v, "default") for v in ("3.5", "3.4", "3.3", "3.2", "3.1")] + [
+            (v, "device22") for v in ("3.3", "3.2", "3.1")
+        ]
+        all_variants.sort(key=lambda x: x[1] != "device22") if len(DEVICE_ID) == 22 else None
+        for variant in all_variants:
             try:
-                res = _make_device(v, key).status()
+                res = _make_device(variant[0], key, variant[1]).status()
             except Exception as e:
                 res = {"Error": str(e), "Err": "exc"}
+            label = _variant_label(variant)
             if res and "dps" in res:
-                working.append(v)
-                out.append(f"3) версия {v}: ✅ ответ получен, DP: {len(res['dps'])}")
+                working.append(variant)
+                out.append(f"3) {label}: ✅ ответ получен, DP: {len(res['dps'])}")
             else:
-                out.append(f"3) версия {v}: ❌ {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+                out.append(f"3) {label}: ❌ {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
         if working:
-            _local.update(dev=None, version=working[0])
-            out.append(f"Итог: подходит версия {working[0]}. Бот переключился на неё. "
-                       f"Чтобы закрепить, добавьте в .env: TUYA_LOCAL_VERSION={working[0]}")
+            best = working[0]
+            _local.update(dev=None, variant=best, version=_variant_label(best))
+            out.append(f"Итог: подходит {_variant_label(best)}. Бот переключился на этот вариант. "
+                       f"Закрепите в .env: TUYA_LOCAL_VERSION={best[0]}"
+                       + (" (тип device22 бот определит сам)" if best[1] == "device22" else ""))
         else:
-            out.append("Итог: ни одна версия не ответила, хотя порт открыт. Скорее всего, неверный local key "
-                       "(ключ меняется при переподключении устройства в Smart Life). Получите свежий: "
-                       "`python -m tinytuya wizard`, впишите в TUYA_LOCAL_KEY и пересоздайте контейнер.")
+            out.append("Итог: ни один вариант не ответил, хотя порт открыт. Скорее всего, неверный local key "
+                       "(он меняется при переподключении устройства в Smart Life). Проверьте длину ключа (шаг 2) "
+                       "или получите свежий: `python -m tinytuya wizard`.")
     return out
 
 
