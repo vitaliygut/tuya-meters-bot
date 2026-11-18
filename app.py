@@ -5,6 +5,7 @@ tuya-meters-bot
 Локальная сеть (tinytuya): алерты (протечка, краны, связь с устройством), без лимитов API.
 """
 import asyncio
+import base64
 import calendar
 import io
 import json
@@ -464,6 +465,7 @@ def _lan_diag_sync():
             out.append(f"Итог: подходит {_variant_label(best)}. Бот переключился на этот вариант. "
                        f"Закрепите в .env: TUYA_LOCAL_VERSION={best[0]}"
                        + (" (тип device22 бот определит сам)" if best[1] == "device22" else ""))
+            out.extend(_lan_probe_dps(key, best))
         else:
             out.append("Итог: ни один вариант не ответил, хотя порт открыт. Скорее всего, неверный local key "
                        "(он меняется при переподключении устройства в Smart Life). Проверьте длину ключа (шаг 2) "
@@ -471,10 +473,69 @@ def _lan_diag_sync():
     return out
 
 
+def _lan_probe_dps(key, variant):
+    """Выясняет, как получить остальные DP (протечка, краны): status(), затем updatedps и приём push-сообщений."""
+    out = []
+    watch_codes = [c for c, *_ in LEAK_WATCH]
+    mapping = load_dp_map()
+    try:
+        d = _make_device(variant[0], key, variant[1])
+        res = d.status()
+        dps = (res or {}).get("dps", {})
+        out.append("4) status() вернул DP: " + (", ".join(sorted(map(str, dps))) or "ничего"))
+        out.append(f"5) соответствие DP из облака: {len(mapping)} шт."
+                   + ("" if mapping else " (пусто: нажмите «📊 Показания» или /diag, чтобы бот получил его из облака)"))
+        ids = sorted(int(i) for i in mapping.values() if str(i).isdigit())
+        if not ids:
+            return out
+        d.set_socketPersistent(True)
+        seen = dict(dps)
+        try:
+            d.updatedps(ids)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                try:
+                    d.heartbeat()
+                except Exception:
+                    pass
+                data = d.receive()
+                if isinstance(data, dict) and isinstance(data.get("dps"), dict):
+                    seen.update(data["dps"])
+        finally:
+            try:
+                d.close()
+            except Exception:
+                pass
+        codes = to_codes(seen)
+        got = [c for c in watch_codes if c in codes]
+        out.append(f"6) после updatedps пришло DP: {len(seen)}; из LEAK_WATCH получены: {', '.join(got) or 'ни одного'}")
+        for code in got:
+            out.append(f"   {code} = {fmt_val(codes[code])}")
+        if not got:
+            out.append("   Локально протечка и краны не видны. Нужен другой способ (напишите, что вернул /lan).")
+    except Exception as e:
+        out.append(f"4-6) проверка DP не удалась: {e}")
+    return out
+
+
+def decode_counters(blob):
+    """counters_data (base64): 8 записей по 8 байт, значение счётчика в литрах = байты 2..4 (big-endian).
+    Сверено с облачными counter7/counter8 Neptun Smart."""
+    try:
+        raw = base64.b64decode(blob)
+    except Exception:
+        return {}
+    return {f"counter{i + 1}": int.from_bytes(raw[i * 8 + 2 : i * 8 + 5], "big") for i in range(len(raw) // 8)}
+
+
 def to_codes(dps):
     """Локальные ключи ('1', '101') -> коды DP ('counter7'), если соответствие известно."""
     rev = {v: k for k, v in load_dp_map().items()}
-    return {rev.get(str(k), str(k)): v for k, v in dps.items()}
+    out = {rev.get(str(k), str(k)): v for k, v in dps.items()}
+    if isinstance(out.get("counters_data"), str):
+        for code, value in decode_counters(out["counters_data"]).items():
+            out.setdefault(code, value)  # локальный запасной источник показаний
+    return out
 
 
 # --- форматирование -----------------------------------------------------
