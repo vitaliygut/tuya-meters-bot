@@ -1,0 +1,1028 @@
+"""Клиент mos.ru для передачи показаний счётчиков воды.
+
+Взят из https://github.com/kostinos/hass-mosru-water (MIT, см. LICENSE-hass-mosru-water); изменён только этот заголовок."""
+from __future__ import annotations
+
+import calendar
+import logging
+import math
+import re
+import time
+import urllib.parse
+from datetime import date, datetime
+from html.parser import HTMLParser
+
+import requests
+
+_LOGGER = logging.getLogger(__name__)
+
+_LOGIN_PAGE_URL  = "https://login.mos.ru/sps/login/methods/password"
+_LOGIN_BO        = (
+    "/sps/oauth/ae"
+    "?scope=profile+openid+contacts+usr_grps+esia"
+    "&response_type=code"
+    "&redirect_uri=https://www.mos.ru/api/acs/v1/login/satisfy"
+    "&client_id=mos.ru"
+)
+_QR_PULL_URL       = "https://login.mos.ru/sps/login/methods/headless/qrCode/pull"
+_QR_REFRESH_URL    = "https://login.mos.ru/sps/login/methods/headless/qrCode/refresh"
+_QR_COMPLETE_URL   = "https://login.mos.ru/sps/login/methods/qrCode/complete"
+_QR_ASKTOTRUST_URL = "https://login.mos.ru/sps/login/ur/askToTrust"
+_SMS_URL           = "https://login.mos.ru/sps/login/methods/sms"
+_TOTP_PATH         = "/sps/login/methods2/totp"
+_SERVICE_PAGE_URL  = "https://www.mos.ru/services/pokazaniya-vodi-i-tepla/new/"
+
+# ed.mos.ru (Электронный дом) — рабочий API показаний. Прежний
+# www.mos.ru/api/utility-meter/v1 не существует: POST /reading всегда отдавал 404,
+# из-за чего показания годами «отправлялись» вникуда.
+_ED_URL          = "https://ed.mos.ru"
+_ED_API          = f"{_ED_URL}/api"
+_ED_COUNTERS     = f"{_ED_API}/efp/counters"
+_ED_PAGE_URL     = f"{_ED_URL}/lk/counters/"
+# OAuth ed.mos.ru: при живой SSO-сессии проходит молча, без ввода пароля.
+_ED_REDIRECT_URI = f"{_ED_URL}/security/callback/sudir/login"
+_ED_OAUTH_URL    = (
+    "https://login.mos.ru/sps/oauth/ae"
+    "?scope=openid+profile"
+    "&access_type=offline"
+    "&response_type=code"
+    f"&redirect_uri={_ED_REDIRECT_URI}"
+    "&client_id=ed.mos.ru"
+)
+_TIMEOUT         = 30
+_USER_AGENT      = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+)
+# my.mos.ru и ed.mos.ru отдают 403 без полного набора браузерных заголовков —
+# антибот смотрит именно на них, а не на cookies.
+_BROWSER_HINTS   = {
+    "Accept-Language": "ru,en;q=0.9",
+    "sec-ch-ua": '"Chromium";v="148", "Not/A)Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+}
+_XHR_HEADERS     = {
+    **_BROWSER_HINTS,
+    "Accept": "application/json, text/plain, */*",
+    "Referer": _ED_PAGE_URL,
+    "Origin": _ED_URL,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
+_NAV_HEADERS     = {
+    **_BROWSER_HINTS,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Временные сбои mos.ru: сервис отвечает 200 с {"error": true, "code": "retry_later"}
+# либо обычным 5xx. Такие ответы не означают проблем с сессией — нужен повтор.
+_TRANSIENT_STATUS  = (429, 500, 502, 503, 504)
+_TRANSIENT_CODES   = {"retry_later", "service_unavailable", "temporarily_unavailable"}
+_RETRY_ATTEMPTS    = 2    # дополнительные попытки для идемпотентных запросов
+_RETRY_DELAY       = 5    # пауза между попытками, сек
+
+_TRUSTED_HOSTS = {'login.mos.ru', 'www.mos.ru', 'ed.mos.ru', 'my.mos.ru'}
+_MAX_RESPONSE_BYTES = 2_000_000
+
+
+class _AuthControlsProbe(HTMLParser):
+    """Collect auth control metadata without retaining HTML or secret values."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.controls: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in {"form", "input", "button", "a"}:
+            return
+        raw = {key: value or "" for key, value in attrs}
+        item = {"tag": tag}
+        for key in ("type", "name", "value"):
+            # Hidden values include CSRF/state and must never reach logs.
+            if key in raw and not (tag == "input" and raw.get("type") == "hidden"):
+                item[key] = raw[key][:80]
+        for key in ("action", "formaction", "href"):
+            if raw.get(key):
+                parts = urllib.parse.urlsplit(raw[key])
+                query_keys = sorted(urllib.parse.parse_qs(parts.query, keep_blank_values=True))
+                item[key] = parts.path or "/"
+                if query_keys:
+                    item[f"{key}_query_keys"] = ",".join(query_keys)
+        self.controls.append(item)
+
+
+def _auth_controls_summary(html: str) -> list[dict[str, str]]:
+    """Return non-secret form metadata for diagnosing changed mos.ru login steps."""
+    parser = _AuthControlsProbe()
+    parser.feed(html)
+    return parser.controls
+
+
+def trusted_url(value: str, *, qr: bool = False) -> str:
+    """Reject external origins before following redirects or publishing QR links."""
+    parts = urllib.parse.urlsplit(value)
+    hosts = {'login.mos.ru'} if qr else _TRUSTED_HOSTS
+    if (parts.scheme != 'https' or parts.hostname not in hosts
+            or parts.port not in (None, 443) or parts.username is not None
+            or parts.password is not None or any(c in value for c in '\\<>[]()')
+            or any(ord(c) <= 32 for c in value)):
+        raise MosRuApiError('Недопустимый адрес сервиса mos.ru')
+    return value
+
+
+def normalized_reading(value: float) -> int:
+    """Validate before integer rounding and before any destructive operation."""
+    if not math.isfinite(value) or value < 0 or value > 1_000_000_000:
+        raise MosRuApiError('Недопустимое показание счётчика')
+    return int(round(value))
+
+
+class MosRuSession(requests.Session):
+    """Validate every prepared request, including redirects, and cap response bodies."""
+
+    def __init__(self):
+        super().__init__()
+        self.trust_env = False
+        self.hooks['response'].append(self._bounded_response)
+
+    @staticmethod
+    def _bounded_response(response, **kwargs):
+        chunks = []
+        total = 0
+        try:
+            for chunk in response.iter_content(65536):
+                total += len(chunk)
+                if total > _MAX_RESPONSE_BYTES:
+                    raise requests.RequestException('Ответ сервиса слишком большой')
+                chunks.append(chunk)
+        except Exception:
+            response.close()
+            raise
+        response._content = b''.join(chunks)
+        response._content_consumed = True
+        return response
+
+    def send(self, request, **kwargs):
+        trusted_url(request.url)
+        kwargs['stream'] = True
+        return super().send(request, **kwargs)
+
+
+def _period_end_of_month(today: date | None = None) -> str:
+    """Последний день текущего месяца в формате YYYY-MM-DD.
+
+    ed.mos.ru привязывает показание к расчётному периоду, а не к дате отправки:
+    в запросе всегда стоит конец месяца (например 2026-08-31).
+    """
+    day = today or date.today()
+    last = calendar.monthrange(day.year, day.month)[1]
+    return day.replace(day=last).isoformat()
+
+
+class _FormParser(HTMLParser):
+    """Extract one form and its hidden inputs from login.mos.ru HTML."""
+
+    def __init__(self, form_id: str | None = None) -> None:
+        super().__init__()
+        self.form_id = form_id
+        self.action = ""
+        self.hidden: dict[str, str] = {}
+        self._active = False
+        self._found = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key: value or "" for key, value in attrs}
+        if tag == "form" and not self._found:
+            if self.form_id is None or values.get("id") == self.form_id:
+                self._active = True
+                self._found = True
+                self.action = values.get("action", "")
+            return
+        if tag != "input" or not self._active or values.get("type", "").lower() != "hidden":
+            return
+        if values.get("name"):
+            self.hidden[values["name"]] = values.get("value", "")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form" and self._active:
+            self._active = False
+
+
+def _parse_form(html: str, *, form_id: str | None = None) -> tuple[str, dict]:
+    """Extract action and hidden fields from the first or a named form."""
+    parser = _FormParser(form_id)
+    parser.feed(html)
+    return parser.action, parser.hidden
+
+
+# Тип счётчика в ответе ed.mos.ru (поле typeName).
+COLD_TYPE = "ХВС"
+HOT_TYPE  = "ГВС"
+
+
+def _counter_type(counter: dict) -> str:
+    return str(counter.get("type") or "").strip().upper()
+
+
+def counters_of_type(counters: list[dict], type_name: str) -> list[dict]:
+    """Счётчики заданного типа; если таких нет — все, чтобы было из чего выбрать."""
+    wanted = type_name.strip().upper()
+    matched = [c for c in counters if _counter_type(c) == wanted]
+    return matched or list(counters)
+
+
+def pick_counters(counters: list[dict]) -> tuple[str | None, str | None]:
+    """(cold_id, hot_id): единственный счётчик ХВС и единственный ГВС, иначе None."""
+    def single(type_name: str) -> str | None:
+        ids = [c["id"] for c in counters if _counter_type(c) == type_name]
+        return ids[0] if len(ids) == 1 else None
+
+    return single(COLD_TYPE), single(HOT_TYPE)
+
+
+def place_label(place: dict) -> str:
+    """Подпись квартиры в списке: «адрес, кв. N — ЕПД код»."""
+    label = ", ".join(
+        part for part in (
+            place.get("address") or "",
+            f"кв. {place['flat']}" if place.get("flat") else "",
+        ) if part
+    )
+    if place.get("paycode"):
+        label = f"{label} — ЕПД {place['paycode']}" if label else f"ЕПД {place['paycode']}"
+    return label or place["user_place_id"]
+
+
+def _unfinished_login_step(url: str) -> str | None:
+    """Путь шага входа, если цепочка остановилась на login.mos.ru, иначе None.
+
+    Успешный вход уходит с login.mos.ru на satisfy портала. Страница
+    /sps/login/... означает, что mos.ru ждёт ещё одно действие пользователя.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.netloc == "login.mos.ru" and parts.path.startswith("/sps/login/"):
+        return parts.path
+    return None
+
+
+class MosRuAuthError(Exception):
+    """Ошибка авторизации."""
+
+
+class MosRuApiError(Exception):
+    """Ошибка API."""
+
+
+class MosRuTemporaryError(MosRuApiError):
+    """Сервис mos.ru временно недоступен — имеет смысл повторить позже."""
+
+
+class MosRuAlreadySubmittedError(MosRuApiError):
+    """Показание за этот период уже внесено на портале.
+
+    ed.mos.ru отвечает 400 «Показание за данный период уже внесено» и не
+    перезаписывает значение. Чтобы заменить его, нужно сначала удалить прежнее
+    через remove_last_indication() — это делается только по явной команде
+    пользователя, автоматика показания не удаляет.
+    """
+
+
+def _parse_api_response(resp: requests.Response) -> dict:
+    """Проверить HTTP-ответ API и вернуть распарсенный JSON.
+
+    Raises:
+        MosRuAuthError: сессия истекла (401/403).
+        MosRuTemporaryError: временный сбой mos.ru (5xx, 429, code=retry_later).
+        MosRuApiError: прочие ошибки.
+    """
+    if resp.status_code in (401, 403):
+        raise MosRuAuthError("Сессия истекла, требуется повторная авторизация")
+    if resp.status_code in _TRANSIENT_STATUS:
+        raise MosRuTemporaryError(
+            f"HTTP {resp.status_code}, сервис временно недоступен"
+        )
+
+    try:
+        data = resp.json()
+    except ValueError as err:
+        raise MosRuApiError("Неожиданный формат ответа") from err
+    if not isinstance(data, dict):
+        raise MosRuApiError('Неожиданный формат ответа')
+
+    code = str(data.get("code", "")).lower()
+    if code in _TRANSIENT_CODES:
+        raise MosRuTemporaryError(
+            f"сервис временно недоступен ({code})"
+        )
+    # ed.mos.ru сообщает об ошибке в поле "error" строкой, а не флагом.
+    err_text = data.get("error") if isinstance(data.get("error"), str) else None
+    if err_text and "уже внесено" in err_text:
+        raise MosRuAlreadySubmittedError('Показание за период уже внесено')
+    # Прочие HTTP-ошибки (404 на неверный эндпоинт, 400 на плохой payload и т.п.).
+    # Проверяем после разбора JSON, чтобы включить в сообщение текст от сервера.
+    if not resp.ok:
+        raise MosRuApiError(
+            f"HTTP {resp.status_code}: запрос отклонён"
+        )
+    if err_text:
+        raise MosRuApiError('Ошибка API')
+    if data.get("error") is True:
+        raise MosRuApiError('Ошибка API')
+    return data
+
+
+class MosRuClient:
+    """HTTP-клиент для работы с mos.ru."""
+
+    def __init__(self) -> None:
+        self._session = MosRuSession()
+        self._session.headers.update({"User-Agent": _USER_AGENT})
+        self._login_referer = "https://login.mos.ru/"
+        self._poll_counter: int = int(datetime.now().timestamp() * 1000)
+
+    # ── QR OAuth ──────────────────────────────────────────────────────────
+
+    def start_qr_session(self) -> dict:
+        """Инициализировать OAuth-сессию и получить данные QR-кода.
+
+        Returns: {"link": str, "expires": float}
+        """
+        try:
+            # www.mos.ru/api/acs/v1/login устанавливает ACS-SESSID и yabm,
+            # без которых satisfy не может завершить обмен кода (возвращает 500).
+            # Следуем редиректу на login.mos.ru/sps/oauth/ae — он регистрирует
+            # authorization request и устанавливает oauth_az.
+            resp_init = self._session.get(
+                "https://www.mos.ru/api/acs/v1/login",
+                allow_redirects=True,
+                timeout=_TIMEOUT,
+            )
+            self._login_referer = resp_init.url
+            # POST refresh создаёт QR-сессию
+            resp = self._session.post(
+                _QR_REFRESH_URL,
+                data="{}",
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Content-Type": "text/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": self._login_referer,
+                },
+                timeout=_TIMEOUT,
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                raise MosRuApiError('Неожиданный редирект QR-сессии')
+            data = resp.json()
+        except requests.RequestException as err:
+            raise MosRuApiError("Сетевая ошибка mos.ru") from err
+        except ValueError as err:
+            raise MosRuApiError("Неожиданный формат ответа") from err
+
+        if not data.get("link"):
+            raise MosRuApiError('QR-сессия не запустилась')
+
+        return {"link": trusted_url(data["link"], qr=True), "expires": data.get("expires", 0)}
+
+    def poll_qr(self) -> str:
+        """Опросить статус QR-сессии.
+
+        Returns: command — showQRCode | askForConfirm | needComplete | needRefresh
+        """
+        try:
+            self._poll_counter += 1
+            resp = self._session.get(
+                _QR_PULL_URL,
+                params={"_": self._poll_counter},
+                headers={
+                    "Accept": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": self._login_referer,
+                },
+                allow_redirects=False,
+                timeout=_TIMEOUT,
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                _LOGGER.error('poll_qr: неожиданный редирект (status=%d)', resp.status_code)
+                raise MosRuApiError('Неожиданный редирект QR-сессии')
+            try:
+                return resp.json().get("command", "")
+            except ValueError:
+                _LOGGER.error(
+                    "poll_qr: не JSON (status=%d)",
+                    resp.status_code,
+                )
+                raise MosRuApiError("Неожиданный формат ответа")
+        except requests.RequestException as err:
+            raise MosRuApiError("Сетевая ошибка mos.ru") from err
+
+    def refresh_qr(self) -> dict:
+        """Обновить истёкший QR-код.
+
+        Returns: {"link": str, "expires": float}
+        """
+        try:
+            resp = self._session.post(
+                _QR_REFRESH_URL,
+                data="{}",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "text/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": self._login_referer,
+                },
+                timeout=_TIMEOUT,
+            )
+            data = resp.json()
+        except requests.RequestException as err:
+            raise MosRuApiError("Сетевая ошибка mos.ru") from err
+        return {"link": trusted_url(data.get("link", ""), qr=True), "expires": data.get("expires", 0)}
+
+    def complete_qr_auth(self) -> str:
+        """Завершить QR-авторизацию: POST qrCode/complete.
+
+        Returns: 'done' | 'sms_required' | 'totp_required'
+
+        Raises:
+            MosRuAuthError: вход остановился на неизвестном шаге login.mos.ru —
+                SSO-сессии нет, считать вход успешным нельзя.
+        """
+        try:
+            resp = self._session.post(
+                _QR_COMPLETE_URL,
+                data={},
+                headers={"Referer": self._login_referer},
+                allow_redirects=True,
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as err:
+            raise MosRuApiError("Сетевая ошибка mos.ru") from err
+        if resp.status_code >= 400:
+            raise MosRuAuthError("Ошибка завершения QR-авторизации")
+        if "methods2/sms" in resp.url or "/methods/sms" in resp.url:
+            self._sms_page_url = resp.url
+            self._sms_form_action, self._sms_hidden = _parse_form(resp.text)
+            self._sms_resend_action, self._sms_resend_hidden = _parse_form(
+                resp.text, form_id="resendBysms"
+            )
+            _LOGGER.debug(
+                "mos.ru confirmation controls (values redacted): %s",
+                _auth_controls_summary(resp.text),
+            )
+            return "sms_required"
+        # Аккаунт защищён приложением-аутентификатором: QR подтверждает только
+        # первый фактор, SSO-сессия появится после ввода TOTP-кода.
+        if urllib.parse.urlsplit(resp.url).path == _TOTP_PATH:
+            self._totp_page_url = resp.url
+            return "totp_required"
+        if "askToTrust" in resp.url:
+            self._trust_device(resp)
+            return "done"
+        step = _unfinished_login_step(resp.url)
+        if step:
+            raise MosRuAuthError(f"Вход не завершён: mos.ru запросил шаг {step}")
+        return "done"
+
+    def request_sms_code(self) -> None:
+        """Submit mos.ru's official fallback form after explicit user action."""
+        if getattr(self, "_sms_resend_requested", False):
+            return
+        action = getattr(self, "_sms_resend_action", "")
+        hidden = dict(getattr(self, "_sms_resend_hidden", {}))
+        if not action:
+            raise MosRuAuthError("mos.ru не предоставил форму запроса SMS-кода")
+        if hidden.get("channel") != "sms":
+            raise MosRuAuthError("Некорректная форма запроса SMS-кода")
+
+        page_url = getattr(self, "_sms_page_url", "")
+        sms_url = urllib.parse.urljoin(page_url, action)
+        trusted_url(sms_url)
+        try:
+            response = self._session.post(
+                sms_url,
+                data=hidden,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": page_url,
+                    "Origin": "https://login.mos.ru",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-User": "?1",
+                },
+                allow_redirects=True,
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as err:
+            raise MosRuApiError("Не удалось запросить SMS-код") from err
+        if response.status_code in _TRANSIENT_STATUS:
+            raise MosRuTemporaryError(
+                f"Запрос SMS-кода временно недоступен: HTTP {response.status_code}"
+            )
+        if response.status_code >= 400:
+            raise MosRuAuthError(
+                f"mos.ru отклонил запрос SMS-кода: HTTP {response.status_code}"
+            )
+
+        self._sms_resend_requested = True
+        self._sms_page_url = response.url
+        self._sms_form_action, self._sms_hidden = _parse_form(response.text)
+
+    def submit_totp(self, code: str) -> None:
+        """Отправить код из приложения-аутентификатора после QR-входа."""
+        page_url = getattr(self, "_totp_page_url", "")
+        if not page_url:
+            raise MosRuAuthError("Нет незавершённого входа с TOTP-кодом")
+        try:
+            resp = self._session.post(
+                page_url,
+                data={"otp": code},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": page_url,
+                    "Origin": "https://login.mos.ru",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-User": "?1",
+                },
+                allow_redirects=False,
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as err:
+            raise MosRuApiError("Сетевая ошибка mos.ru") from err
+        resp = self._follow_redirects(resp)
+
+        if urllib.parse.urlsplit(resp.url).path == _TOTP_PATH:
+            raise MosRuAuthError("Неверный код из приложения-аутентификатора")
+        if "askToTrust" in resp.url:
+            self._trust_device(resp)
+            return
+        if resp.status_code >= 400:
+            raise MosRuAuthError(f"Ошибка входа после TOTP-кода: HTTP {resp.status_code}")
+        step = _unfinished_login_step(resp.url)
+        if step:
+            raise MosRuAuthError(f"Вход не завершён: mos.ru запросил шаг {step}")
+        self._totp_page_url = ""
+
+    def submit_sms_and_trust(self, code: str) -> None:
+        """Отправить 6-значный код подтверждения и проверить завершение входа."""
+        page_url = getattr(self, "_sms_page_url", "")
+        form_action = getattr(self, "_sms_form_action", "")
+        hidden = dict(getattr(self, "_sms_hidden", {}))
+
+        if form_action.startswith("http"):
+            sms_url = form_action
+        elif form_action.startswith("/"):
+            sms_url = f"https://login.mos.ru{form_action}"
+        else:
+            bo_param = urllib.parse.quote(_LOGIN_BO, safe="")
+            sms_url = f"{_SMS_URL}?bo={bo_param}"
+
+        post_data = {**hidden, "sms-code": code}
+        try:
+            resp = self._session.post(
+                sms_url,
+                data=post_data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": page_url or sms_url,
+                },
+                allow_redirects=True,
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as err:
+            raise MosRuApiError("Сетевая ошибка mos.ru") from err
+
+        if resp.status_code >= 400:
+            raise MosRuAuthError("Неверный SMS-код")
+
+        # Неверный или просроченный код mos.ru отклоняет обычной HTML-страницей
+        # с HTTP 200. Раньше такой ответ считался успехом, config flow сохранял
+        # cookies без Ltpatoken2 и после reload показывал «сессия истекла».
+        if "methods2/sms" in resp.url or "/methods/sms" in resp.url:
+            raise MosRuAuthError("Неверный или просроченный SMS-код")
+
+        # Если попали на askToTrust — доверяемся устройству
+        if "askToTrust" in resp.url:
+            self._trust_device(resp)
+            return
+
+        step = _unfinished_login_step(resp.url)
+        if step:
+            raise MosRuAuthError(f"Вход не завершён: mos.ru запросил шаг {step}")
+
+        cookie_names = {c.name for c in self._session.cookies}
+        if "Ltpatoken2" not in cookie_names:
+            raise MosRuAuthError("Авторизация не завершена: Ltpatoken2 не установлен")
+
+    def _trust_device(self, resp: requests.Response) -> None:
+        """Ответить «доверять устройству» на странице askToTrust."""
+        trust_page_url = resp.url
+        trust_form_action, trust_hidden = _parse_form(resp.text)
+        if trust_form_action.startswith("http"):
+            trust_url = trust_form_action
+        elif trust_form_action.startswith("/"):
+            trust_url = f"https://login.mos.ru{trust_form_action}"
+        else:
+            trust_url = trust_page_url or _QR_ASKTOTRUST_URL
+
+        trust_data = {**trust_hidden, "action": "trust"}
+        try:
+            resp2 = self._session.post(
+                trust_url,
+                data=trust_data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": trust_page_url,
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-User": "?1",
+                },
+                allow_redirects=False,
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as err:
+            raise MosRuApiError("Сетевая ошибка mos.ru") from err
+
+        resp2 = self._follow_redirects(resp2)
+
+        if resp2.status_code >= 400 and resp2.status_code < 500:
+            raise MosRuAuthError("Ошибка доверия устройству")
+        cookie_names = {c.name for c in self._session.cookies}
+        if "Ltpatoken2" not in cookie_names:
+            raise MosRuAuthError("Авторизация не завершена: Ltpatoken2 не установлен")
+
+    def _follow_redirects(self, resp: requests.Response) -> requests.Response:
+        """Пройти редиректы вручную, как браузерная навигация."""
+        for _ in range(15):
+            loc = resp.headers.get("Location", "")
+            if resp.status_code not in (301, 302, 303, 307, 308) or not loc:
+                break
+            if not loc.startswith("http"):
+                loc = urllib.parse.urljoin(resp.url, loc)
+            # satisfy требует sec-fetch-* заголовки как у браузерной навигации
+            req_headers: dict[str, str] = {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": resp.url,
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-site",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            }
+            try:
+                resp = self._session.get(
+                    loc,
+                    headers=req_headers,
+                    allow_redirects=False,
+                    timeout=_TIMEOUT,
+                )
+            except requests.RequestException as err:
+                raise MosRuApiError("Сетевая ошибка mos.ru") from err
+        return resp
+
+    def try_refresh_acst(self) -> bool:
+        """Обновить acst через официальный ACS probe endpoint.
+
+        Браузер вызывает /api/acs/v1/probe при каждой загрузке страницы.
+        Если acst истёк, probe тихо делает OAuth через Ltpatoken2 и выдаёт
+        новый acst перед редиректом на back_url?status=200.
+        Возвращает True если сессия жива (финальный URL содержит status=200).
+        """
+        back_url = "https://www.mos.ru/shared/acs/core0521.html?fieldName=status"
+        try:
+            resp = self._session.get(
+                "https://www.mos.ru/api/acs/v1/probe",
+                params={"back_url": back_url},
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://www.mos.ru/",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+                allow_redirects=True,
+                timeout=_TIMEOUT,
+            )
+            if resp.status_code in _TRANSIENT_STATUS:
+                raise MosRuTemporaryError(f"Обновление acst: HTTP {resp.status_code}")
+            return "status=200" in resp.url
+        except requests.RequestException as err:
+            raise MosRuTemporaryError("Сетевая ошибка при обновлении acst") from err
+
+    def warm_session(self) -> None:
+        """GET главной и /pgu/ mos.ru — инициализирует сессии портала после OAuth."""
+        warm_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        }
+        for url in (
+            "https://www.mos.ru/",
+            _SERVICE_PAGE_URL,
+        ):
+            try:
+                self._session.get(
+                    url,
+                    headers=warm_headers,
+                    allow_redirects=True,
+                    timeout=_TIMEOUT,
+                )
+            except requests.RequestException as err:
+                _LOGGER.warning("Не удалось прогреть сессию mos.ru")
+
+    def get_session_cookies(self) -> dict:
+        """Вернуть текущие cookies с доменами для сохранения в конфиге."""
+        return {
+            c.name: {"value": c.value, "domain": c.domain or "", "path": c.path or "/"}
+            for c in self._session.cookies
+        }
+
+    def restore_session(self, cookies: dict) -> None:
+        """Восстановить сессию из сохранённых cookies (с доменами)."""
+        self._session = MosRuSession()
+        self._session.headers.update({"User-Agent": _USER_AGENT})
+        self._login_referer = "https://login.mos.ru/"
+        for name, data in cookies.items():
+            if isinstance(data, dict):
+                self._session.cookies.set(
+                    name, data["value"],
+                    domain=data.get("domain") or None,
+                    path=data.get("path") or "/",
+                )
+            else:
+                # обратная совместимость: старый формат name → value (строка)
+                self._session.cookies.set(name, data)
+
+    # ── API ───────────────────────────────────────────────────────────────
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        retries: int = 0,
+        **kwargs,
+    ) -> dict:
+        """Выполнить запрос к API и вернуть проверенный JSON.
+
+        retries — число дополнительных попыток при временном сбое mos.ru
+        (использовать только для идемпотентных запросов).
+        """
+        last_err = MosRuTemporaryError("Запрос не был выполнен")
+        for attempt in range(retries + 1):
+            if attempt:
+                time.sleep(_RETRY_DELAY)
+            try:
+                resp = self._session.request(method, url, timeout=_TIMEOUT, **kwargs)
+            except requests.RequestException as err:
+                last_err = MosRuTemporaryError("Сетевая ошибка mos.ru")
+                continue
+            try:
+                return _parse_api_response(resp)
+            except MosRuTemporaryError as err:
+                last_err = err
+        raise last_err
+
+    # ── ed.mos.ru ─────────────────────────────────────────────────────────
+
+    def authorize_ed(self) -> None:
+        """Авторизоваться в ed.mos.ru поверх действующей SSO-сессии mos.ru.
+
+        При живом Ltpatoken2 OAuth проходит молча: login.mos.ru редиректит на
+        callback с ?code=, который обменивается на сессионную cookie ed.mos.ru.
+        Дальше все запросы к API идут по cookies, без токенов в query.
+
+        Если ed.mos.ru отклонил обмен кода, а у нас были его прежние cookies,
+        вход повторяется один раз без них. Так бывает после перезапуска HA:
+        restore_session() поднимает cookies ed.mos.ru (Authorization, Refresh)
+        вместе с SSO, а они живут около часа и к этому времени уже истекли —
+        с ними ed.mos.ru отвечает 401, хотя сама сессия mos.ru жива и повторный
+        вход по QR не нужен.
+        """
+        status = self._exchange_ed_code()
+        if status in (401, 403) and self._drop_ed_cookies():
+            _LOGGER.info("ed.mos.ru отклонил устаревшие cookies; повторяем вход без них")
+            status = self._exchange_ed_code()
+        if status in (401, 403):
+            raise MosRuAuthError("ed.mos.ru отклонил авторизацию")
+
+    def _exchange_ed_code(self) -> int:
+        """Пройти OAuth ed.mos.ru и обменять code на сессию; вернуть HTTP-статус обмена.
+
+        401/403 возвращаются вызывающему: решать, повторять ли, — ему.
+        """
+        try:
+            resp = self._session.get(
+                _ED_OAUTH_URL,
+                headers=_NAV_HEADERS,
+                allow_redirects=True,
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as err:
+            raise MosRuTemporaryError("Сетевая ошибка при входе в ed.mos.ru") from err
+
+        if resp.status_code in _TRANSIENT_STATUS:
+            raise MosRuTemporaryError(f"ed.mos.ru OAuth: HTTP {resp.status_code}")
+
+        code_m = re.search(r"[?&]code=([^&]+)", resp.url)
+        if not code_m:
+            # Сессия SSO истекла — цепочка ушла на форму логина вместо callback.
+            raise MosRuAuthError("Не удалось авторизоваться в ed.mos.ru: код не получен")
+
+        try:
+            auth = self._session.post(
+                f"{_ED_API}/profile/auth/web",
+                params={"code": code_m.group(1)},
+                headers={**_XHR_HEADERS, "Referer": resp.url},
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as err:
+            raise MosRuTemporaryError("Сетевая ошибка ed.mos.ru auth") from err
+
+        if auth.status_code in _TRANSIENT_STATUS:
+            raise MosRuTemporaryError(f"ed.mos.ru auth: HTTP {auth.status_code}")
+        if auth.status_code not in (401, 403) and not auth.ok:
+            raise MosRuApiError(f"ed.mos.ru auth: HTTP {auth.status_code}")
+        return auth.status_code
+
+    def _drop_ed_cookies(self) -> bool:
+        """Удалить cookies ed.mos.ru, оставив SSO mos.ru; True, если было что удалять."""
+        stale = [
+            c for c in self._session.cookies
+            if (c.domain or "").lstrip(".") == "ed.mos.ru"
+        ]
+        for c in stale:
+            self._session.cookies.clear(c.domain, c.path, c.name)
+        return bool(stale)
+
+    def _counters_payload(self, user_place_id: str) -> list[dict]:
+        """Сырой ответ listByPayerCode: список квартир со счётчиками."""
+        data = self._request_json(
+            "GET",
+            f"{_ED_COUNTERS}/listByPayerCode/",
+            params={"userPlaceIds": user_place_id},
+            headers=_XHR_HEADERS,
+            retries=_RETRY_ATTEMPTS,
+        )
+        places = data.get("data")
+        if not isinstance(places, list):
+            raise MosRuApiError('Неожиданный ответ сервиса')
+        return places
+
+    def list_places(self) -> list[dict]:
+        """Квартиры из профиля ed.mos.ru — для выбора в мастере настройки.
+
+        Профиль перечисляет квартиры в data.addresses: fls (код плательщика),
+        flat, userPlaceId и готовая строка адреса дома addressCaption.
+
+        Returns: [{user_place_id, paycode, flat, address}] — все значения строки.
+        """
+        data = self._request_json(
+            "GET",
+            f"{_ED_API}/profile/user/getInfo/",
+            headers=_XHR_HEADERS,
+            retries=_RETRY_ATTEMPTS,
+        )
+        result: list[dict] = []
+        seen: set[str] = set()
+        for place in (data.get("data") or {}).get("addresses") or []:
+            if not isinstance(place, dict) or not place.get("userPlaceId"):
+                continue
+            user_place_id = str(place["userPlaceId"])
+            if user_place_id in seen:
+                continue
+            seen.add(user_place_id)
+            result.append({
+                "user_place_id": user_place_id,
+                # flat и fls приходят то строкой, то числом
+                "paycode": str(place.get("fls") or ""),
+                "flat": str(place.get("flat") or ""),
+                # caption — запасной вариант: это может быть собственное название
+                # квартиры у пользователя (например, «Дача»), а не адрес
+                "address": str(place.get("addressCaption") or place.get("caption") or ""),
+            })
+        return result
+
+    def find_user_place_id(self, paycode: str, flat: str) -> str:
+        """Определить userPlaceId по коду плательщика и номеру квартиры.
+
+        ed.mos.ru адресует квартиру своим userPlaceId, а не paycode. Нужен
+        координатору: после «Выйти и войти заново» userPlaceId ищется заново
+        по сохранённым реквизитам.
+        """
+        for place in self.list_places():
+            if place["paycode"] != str(paycode):
+                continue
+            if flat and place["flat"] != str(flat):
+                continue
+            return place["user_place_id"]
+        raise MosRuApiError(
+            f"В профиле ed.mos.ru не найдена квартира с кодом плательщика {paycode}"
+        )
+
+    def get_counters(self, user_place_id: str) -> list[dict]:
+        """Список счётчиков воды для мастера настройки."""
+        result: list[dict] = []
+        for place in self._counters_payload(user_place_id):
+            for c in place.get("activeCounters") or []:
+                counter_id = str(c.get("counterId") or "")
+                if not counter_id:
+                    continue
+                result.append({
+                    "id":   counter_id,
+                    "name": c.get("num", ""),
+                    "type": c.get("typeName", ""),   # ХВС / ГВС
+                })
+        return result
+
+    def get_device_info(self, user_place_id: str) -> dict[str, dict]:
+        """Текущий статус счётчиков: показания, поверка, доступность отправки.
+
+        Returns: {counter_id: {type, number, current_reading, reading_period,
+                               readonly, inspection_date, inspection_status}}
+        """
+        result: dict[str, dict] = {}
+        for place in self._counters_payload(user_place_id):
+            for c in place.get("activeCounters") or []:
+                counter_id = str(c.get("counterId") or "")
+                if not counter_id or counter_id in result:
+                    continue
+                last = c.get("lastIndication") or {}
+                result[counter_id] = {
+                    "type":              c.get("typeName", ""),
+                    "number":            c.get("num", ""),
+                    "current_reading":   last.get("indication"),
+                    "reading_period":    last.get("period"),
+                    # enableTransfer=False — портал сейчас не принимает показания
+                    "readonly":          not c.get("enableTransfer", True),
+                    "inspection_date":   c.get("checkUpDate"),
+                    "inspection_status": c.get("checkupStatus", ""),
+                }
+        return result
+
+    def send_reading(
+        self,
+        user_place_id: str,
+        counter_id: str,
+        value_m3: float,
+        period: str | None = None,
+    ) -> dict:
+        """Передать показание счётчика (в м³).
+
+        period — конец расчётного месяца (YYYY-MM-DD), как ждёт портал; по
+        умолчанию последний день текущего месяца.
+        Значение уходит целым числом: портал принимает только целые м³.
+
+        Raises:
+            MosRuAlreadySubmittedError: за этот период показание уже внесено.
+        """
+        # Без ретраев: повтор может создать дубль. Временный сбой поднимается
+        # наружу, отправку повторит координатор.
+        data = self._request_json(
+            "PUT",
+            f"{_ED_COUNTERS}/addIndications/",
+            params={
+                "userPlaceId": user_place_id,
+                "counterId": counter_id,
+                "indication": normalized_reading(value_m3),
+                "period": period or _period_end_of_month(),
+            },
+            headers=_XHR_HEADERS,
+        )
+        if not (data.get("data") or {}).get("result"):
+            raise MosRuApiError('Показание не принято')
+        return data
+
+    def remove_last_indication(self, user_place_id: str, counter_id: str) -> dict:
+        """Удалить последнее показание счётчика на портале.
+
+        Нужно, чтобы перезаписать показание за уже закрытый период: сам
+        addIndications значение не заменяет, а отвечает 400.
+
+        Вызывается ТОЛЬКО по явной команде пользователя: удаляется последнее
+        показание независимо от того, кто его внёс (портал помечает источник в
+        поле source — запись могла прийти от управляющей компании).
+        """
+        data = self._request_json(
+            "DELETE",
+            f"{_ED_COUNTERS}/removeLastValue/",
+            params={"counterId": counter_id, "userPlaceId": user_place_id},
+            headers=_XHR_HEADERS,
+        )
+        if not (data.get("data") or {}).get("result"):
+            raise MosRuApiError('Показание не удалено')
+        return data

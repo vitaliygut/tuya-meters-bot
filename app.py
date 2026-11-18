@@ -6,6 +6,7 @@ tuya-meters-bot
 """
 import asyncio
 import calendar
+import io
 import json
 import logging
 import os
@@ -14,10 +15,22 @@ import threading
 import time
 from datetime import datetime
 
+import qrcode
 import tinytuya
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+
+import mosru
+from mosru_api import MosRuApiError, MosRuAuthError, MosRuTemporaryError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tuya-bot")
@@ -53,6 +66,14 @@ NO_DATA_ALERT_DAYS = float(os.environ.get("NO_DATA_ALERT_DAYS", "3"))  # нет 
 # ежемесячный отчёт: число месяца (0 = выключен) и час по времени TZ
 MONTHLY_REPORT_DAY = int(os.environ.get("MONTHLY_REPORT_DAY", "0"))
 MONTHLY_REPORT_HOUR = int(os.environ.get("MONTHLY_REPORT_HOUR", "9"))
+
+# передача показаний на mos.ru (Электронный дом): off | confirm (с кнопкой подтверждения) | auto
+MOSRU_MODE = os.environ.get("MOSRU_MODE", "off").strip().lower()
+MOSRU_SUBMIT_DAY = int(os.environ.get("MOSRU_SUBMIT_DAY") or MONTHLY_REPORT_DAY or 20)
+MOSRU_SUBMIT_HOUR = int(os.environ.get("MOSRU_SUBMIT_HOUR") or MONTHLY_REPORT_HOUR)
+MOSRU_COLD_CODE = os.environ.get("MOSRU_COLD_CODE", "counter8").strip()  # DP холодной воды Neptun
+MOSRU_HOT_CODE = os.environ.get("MOSRU_HOT_CODE", "counter7").strip()    # DP горячей воды Neptun
+MOSRU_MAX_DELTA = int(os.environ.get("MOSRU_MAX_DELTA", "100"))  # макс. рост относительно портала, м³
 
 
 def parse_sensors(raw):
@@ -112,11 +133,12 @@ LEAK_WATCH = parse_watch(os.environ.get("LEAK_WATCH", DEFAULT_WATCH))
 BTN_NOW = "📊 Показания"
 BTN_HEALTH = "🩺 Состояние"
 BTN_RAW = "🔧 Все DP"
+BTN_MOSRU = "📤 mos.ru"
 
-KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=BTN_NOW)], [KeyboardButton(text=BTN_HEALTH), KeyboardButton(text=BTN_RAW)]],
-    resize_keyboard=True,
-)
+_rows = [[KeyboardButton(text=BTN_NOW)], [KeyboardButton(text=BTN_HEALTH), KeyboardButton(text=BTN_RAW)]]
+if MOSRU_MODE != "off":
+    _rows.insert(1, [KeyboardButton(text=BTN_MOSRU)])
+KEYBOARD = ReplyKeyboardMarkup(keyboard=_rows, resize_keyboard=True)
 
 # --- хранилище (SQLite) -------------------------------------------------
 def db():
@@ -179,6 +201,15 @@ def api_usage():
     except Exception:
         return 0
 
+
+mosru_svc = mosru.MosRuService(
+    meta_get,
+    meta_set,
+    place_id=os.environ.get("MOSRU_USER_PLACE_ID", "").strip(),
+    cold_id=os.environ.get("MOSRU_COLD_ID", "").strip(),
+    hot_id=os.environ.get("MOSRU_HOT_ID", "").strip(),
+    max_delta=MOSRU_MAX_DELTA,
+)
 
 # --- облако Tuya: показания ----------------------------------------------
 cloud = tinytuya.Cloud(apiRegion=REGION, apiKey=API_ID, apiSecret=API_SECRET, apiDeviceID=DEVICE_ID)
@@ -446,6 +477,12 @@ def fmt_health():
         lines.append("Связь по LAN: ожидание первого ответа")
     if MONTHLY_REPORT_DAY:
         lines.append(f"Ежемесячный отчёт: {MONTHLY_REPORT_DAY} числа в {MONTHLY_REPORT_HOUR:02d}:00")
+    if MOSRU_MODE != "off":
+        lines.append(
+            f"mos.ru: режим {MOSRU_MODE}, {MOSRU_SUBMIT_DAY} числа в {MOSRU_SUBMIT_HOUR:02d}:00, "
+            f"сессия {'есть' if mosru_svc.has_session() else 'нет (/mosru_login)'}, "
+            f"последняя передача: {meta_get('mosru_last') or 'ещё не было'}"
+        )
     last_ok = meta_get("last_ok_ts")
     lines.append(f"Последние показания: {fmt_ts(float(last_ok)) if last_ok else 'ещё не снимались'}")
     if SENSORS and DAILY_READ_HOUR >= 0:
@@ -459,6 +496,7 @@ def fmt_health():
 bot = Bot(TG_TOKEN)
 dp = Dispatcher()
 dp.message.filter(F.chat.id == CHAT_ID)  # отвечаем только владельцу
+dp.callback_query.filter(F.message.chat.id == CHAT_ID)
 
 sent_alerts = {}  # key -> время последнего уведомления
 
@@ -691,6 +729,363 @@ async def daily_loop():
         await asyncio.sleep(300)
 
 
+# --- передача показаний на mos.ru -----------------------------------------------
+mosru_state = {"wait": None, "pending": None, "task": None, "places": None}
+
+
+def mosru_error_text(e):
+    if isinstance(e, mosru.NeedLogin):
+        return "🔑 Нет действующей сессии mos.ru. Выполните /mosru_login."
+    if isinstance(e, (mosru.NeedSetup, mosru.MosRuError)):
+        return f"⚠️ {e}"
+    if isinstance(e, MosRuTemporaryError):
+        return "⏳ mos.ru временно недоступен, попробуйте позже."
+    return f"⚠️ Ошибка mos.ru: {e}"
+
+
+def neptun_values(status):
+    """Показания Neptun -> целые м³ для портала (портал принимает только целые)."""
+    scales = {code: scale for code, _, scale, _ in SENSORS}
+    if MOSRU_COLD_CODE == MOSRU_HOT_CODE:
+        raise mosru.MosRuError("MOSRU_COLD_CODE и MOSRU_HOT_CODE должны различаться")
+    out = {}
+    for label, code in (("cold", MOSRU_COLD_CODE), ("hot", MOSRU_HOT_CODE)):
+        if code not in scales:
+            raise mosru.MosRuError(f"Код {code} не найден в SENSORS")
+        if code not in status:
+            raise mosru.MosRuError(f"В ответе Tuya нет показания {code}")
+        try:
+            out[label] = mosru.normalized_reading(float(status[code]) * scales[code])
+        except (TypeError, ValueError, MosRuApiError) as e:
+            raise mosru.MosRuError(f"Недопустимое показание {code}: {status[code]}") from e
+    return out
+
+
+async def mosru_prompt(chat_id):
+    """Показывает, что будет отправлено, и просит подтверждение кнопкой."""
+    try:
+        status = await get_status()
+        record_readings(status)
+        values = neptun_values(status)
+        rows = await asyncio.to_thread(mosru_svc.plan, values)
+    except Exception as e:
+        if not isinstance(e, (mosru.NeedLogin, mosru.NeedSetup, mosru.MosRuError, MosRuTemporaryError)):
+            log.exception("mosru_prompt")
+        await bot.send_message(chat_id, mosru_error_text(e))
+        return
+    text = "📤 Передача показаний на mos.ru\n" + mosru.describe_rows(rows)
+    if all(r["status"] == "already" for r in rows):
+        meta_set("mosru_last", datetime.now().strftime("%Y-%m"))
+        await bot.send_message(chat_id, text + "\n\nЗа этот месяц показания уже внесены.")
+        return
+    if any(r["status"] in ("closed", "anomaly", "no_prev") for r in rows):
+        await bot.send_message(chat_id, text + "\n\nОтправка недоступна, пока не устранена причина выше.")
+        return
+    mosru_state["pending"] = {"values": values, "ts": time.time()}
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Отправить", callback_data="mosru_send"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="mosru_cancel"),
+        ]]
+    )
+    await bot.send_message(chat_id, text + "\n\nОтправить эти показания?", reply_markup=kb)
+
+
+async def mosru_do_submit(values, from_auto=False):
+    try:
+        rows = await asyncio.to_thread(mosru_svc.submit, values)
+    except Exception as e:
+        if not isinstance(e, (mosru.NeedLogin, mosru.NeedSetup, mosru.MosRuError, MosRuTemporaryError)):
+            log.exception("mosru_submit")
+        text = mosru_error_text(e)
+        if from_auto:
+            await raise_alert("mosru_submit", "📤 mos.ru: не удалось передать показания.\n" + text, repeat=86400)
+        else:
+            await notify("📤 mos.ru: не удалось передать показания.\n" + text)
+        return False
+    text = "📤 Показания на mos.ru:\n" + mosru.describe_rows(rows)
+    done = all(r.get("outcome") in ("submitted", "already") for r in rows)
+    if done:
+        meta_set("mosru_last", datetime.now().strftime("%Y-%m"))
+        sent_alerts.pop("mosru_submit", None)
+    else:
+        text += "\n\n⚠️ Передача завершилась частично. Автоматически повторяться не буду, проверьте портал."
+    await notify(text)
+    return done
+
+
+@dp.message(F.text == BTN_MOSRU)
+async def mosru_button(m: Message):
+    if MOSRU_MODE == "off":
+        await m.answer("Передача на mos.ru выключена (MOSRU_MODE=off).")
+        return
+    await mosru_prompt(m.chat.id)
+
+
+@dp.callback_query(F.data == "mosru_send")
+async def mosru_cb_send(cb: CallbackQuery):
+    pending = mosru_state["pending"]
+    if not pending or time.time() - pending["ts"] > 1800:
+        mosru_state["pending"] = None
+        await cb.answer("Предложение устарело, нажмите «📤 mos.ru» заново.", show_alert=True)
+        return
+    mosru_state["pending"] = None
+    await cb.answer("Отправляю…")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await mosru_do_submit(pending["values"])
+
+
+@dp.callback_query(F.data == "mosru_cancel")
+async def mosru_cb_cancel(cb: CallbackQuery):
+    mosru_state["pending"] = None
+    await cb.answer("Отменено")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# --- вход в mos.ru по QR ---------------------------------------------------------
+async def send_qr(chat_id, link):
+    buf = io.BytesIO()
+    qrcode.make(link).save(buf, format="PNG")
+    await bot.send_photo(
+        chat_id,
+        BufferedInputFile(buf.getvalue(), "mosru_qr.png"),
+        caption=(
+            "Отсканируйте QR в приложении «mos.ru» или «Госуслуги Москвы» (кнопка сканера).\n"
+            "Если открыли чат на телефоне, можно просто перейти по ссылке:\n" + link
+        ),
+    )
+
+
+async def mosru_choose_place(chat_id, place):
+    counters, cold, hot = await asyncio.to_thread(mosru_svc.select_place, place)
+    _, cold_id, hot_id = mosru_svc.ids()
+    lines = [f"✅ Вход выполнен. Квартира: {mosru.place_title(place)}"]
+    if cold_id and hot_id:
+        lines.append("Счётчики ХВС и ГВС определены. Проверьте командой /mosru_status.")
+    else:
+        lines.append("Не удалось однозначно определить счётчики. Найденные на портале:")
+        for c in counters:
+            lines.append(f"• {c['type']} №{c['name']}, id {c['id']}")
+        lines.append("Задайте MOSRU_COLD_ID и MOSRU_HOT_ID в .env и перезапустите бота.")
+    await bot.send_message(chat_id, "\n".join(lines))
+    await clear_alert("mosru_auth", "✅ Сессия mos.ru восстановлена.")
+
+
+async def mosru_finish_login(chat_id):
+    places = await asyncio.to_thread(mosru_svc.login_finish)
+    if not places:
+        await bot.send_message(chat_id, "В профиле «Электронный дом» нет квартир. Добавьте квартиру на ed.mos.ru и повторите /mosru_login.")
+        return
+    wanted = os.environ.get("MOSRU_USER_PLACE_ID", "").strip()
+    chosen = next((p for p in places if p["user_place_id"] == wanted), None) if wanted else None
+    if chosen is None and len(places) == 1:
+        chosen = places[0]
+    if chosen is not None:
+        await mosru_choose_place(chat_id, chosen)
+        return
+    mosru_state["places"] = places
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=mosru.place_title(p)[:60], callback_data=f"mosru_place:{i}")]
+                         for i, p in enumerate(places)]
+    )
+    await bot.send_message(chat_id, "Выберите квартиру:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("mosru_place:"))
+async def mosru_cb_place(cb: CallbackQuery):
+    places = mosru_state["places"] or []
+    try:
+        place = places[int(cb.data.split(":", 1)[1])]
+    except (ValueError, IndexError):
+        await cb.answer("Список устарел, выполните /mosru_login", show_alert=True)
+        return
+    await cb.answer()
+    mosru_state["places"] = None
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await mosru_choose_place(cb.message.chat.id, place)
+    except Exception as e:
+        log.exception("select_place")
+        await bot.send_message(cb.message.chat.id, mosru_error_text(e))
+
+
+async def mosru_login_flow(chat_id):
+    try:
+        qr = await asyncio.to_thread(mosru_svc.login_start)
+        await send_qr(chat_id, qr["link"])
+        confirm_sent = False
+        for _ in range(150):  # до 5 минут
+            await asyncio.sleep(2)
+            cmd = await asyncio.to_thread(mosru_svc.login_poll)
+            if cmd == "needComplete":
+                state = await asyncio.to_thread(mosru_svc.login_complete)
+                if state == "totp_required":
+                    mosru_state["wait"] = "totp"
+                    await bot.send_message(chat_id, "Введите 6-значный код из приложения-аутентификатора (одним сообщением).")
+                elif state == "sms_required":
+                    mosru_state["wait"] = "sms"
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📩 Прислать SMS-код", callback_data="mosru_sms")]])
+                    await bot.send_message(
+                        chat_id,
+                        "mos.ru просит код подтверждения. Введите уже полученный 6-значный код или запросите SMS кнопкой.",
+                        reply_markup=kb,
+                    )
+                else:
+                    await mosru_finish_login(chat_id)
+                return
+            if cmd == "askForConfirm" and not confirm_sent:
+                confirm_sent = True
+                await bot.send_message(chat_id, "Подтвердите вход в приложении mos.ru.")
+            elif cmd == "needRefresh":
+                qr = await asyncio.to_thread(mosru_svc.login_refresh)
+                await send_qr(chat_id, qr["link"])
+        await bot.send_message(chat_id, "Время ожидания QR истекло. Повторите /mosru_login.")
+    except MosRuAuthError as e:
+        await bot.send_message(chat_id, f"Вход не завершён: {e}")
+    except Exception as e:
+        log.exception("mosru_login")
+        await bot.send_message(chat_id, f"Ошибка входа в mos.ru: {e}")
+    finally:
+        mosru_state["task"] = None
+
+
+@dp.message(Command("mosru_login"))
+async def mosru_login_cmd(m: Message):
+    task = mosru_state["task"]
+    if task and not task.done():
+        await m.answer("Вход уже выполняется, отсканируйте последний QR.")
+        return
+    mosru_state["wait"] = None
+    mosru_state["task"] = asyncio.create_task(mosru_login_flow(m.chat.id))
+
+
+@dp.callback_query(F.data == "mosru_sms")
+async def mosru_cb_sms(cb: CallbackQuery):
+    try:
+        await asyncio.to_thread(mosru_svc.login_request_sms)
+        await cb.answer("SMS запрошено")
+        await bot.send_message(cb.message.chat.id, "Введите код из SMS одним сообщением.")
+    except Exception as e:
+        await cb.answer(f"Не удалось запросить SMS: {e}"[:190], show_alert=True)
+
+
+@dp.message(F.text.regexp(r"^\s*\d{6}\s*$"))
+async def mosru_code(m: Message):
+    wait = mosru_state["wait"]
+    if not wait:
+        return
+    submit = mosru_svc.login_submit_totp if wait == "totp" else mosru_svc.login_submit_sms
+    try:
+        await asyncio.to_thread(submit, m.text.strip())
+    except MosRuAuthError as e:
+        await m.answer(f"{e}. Введите код ещё раз или начните заново: /mosru_login")
+        return
+    except Exception as e:
+        log.exception("mosru_code")
+        await m.answer(f"Ошибка: {e}")
+        return
+    mosru_state["wait"] = None
+    try:
+        await m.delete()  # код одноразовый, но в чате ему делать нечего
+    except Exception:
+        pass
+    try:
+        await mosru_finish_login(m.chat.id)
+    except Exception as e:
+        log.exception("mosru_finish")
+        await m.answer(mosru_error_text(e))
+
+
+@dp.message(Command("mosru_status"))
+async def mosru_status_cmd(m: Message):
+    try:
+        info = await asyncio.to_thread(mosru_svc.get_info)
+    except Exception as e:
+        await m.answer(mosru_error_text(e))
+        return
+    _, cold_id, hot_id = mosru_svc.ids()
+    lines = ["📋 Счётчики на портале:"]
+    for cid, inf in info.items():
+        mark = " (ХВС для бота)" if cid == cold_id else " (ГВС для бота)" if cid == hot_id else ""
+        lines.append(
+            f"• {inf['type']} №{inf['number']}{mark}: {inf['current_reading']} м³, период {inf['reading_period']}, "
+            f"приём показаний {'закрыт' if inf['readonly'] else 'открыт'}, поверка до {inf['inspection_date']}"
+        )
+    await answer_long(m, "\n".join(lines))
+
+
+@dp.message(Command("mosru_logout"))
+async def mosru_logout_cmd(m: Message):
+    mosru_svc.logout()
+    await m.answer("Сессия mos.ru удалена из бота. Для повторного входа: /mosru_login")
+
+
+# --- фоновые задачи mos.ru -----------------------------------------------------------
+def mosru_due(now):
+    if MOSRU_MODE == "off" or not MOSRU_SUBMIT_DAY:
+        return False
+    day = min(MOSRU_SUBMIT_DAY, calendar.monthrange(now.year, now.month)[1])
+    if (now.day, now.hour) < (day, MOSRU_SUBMIT_HOUR):
+        return False
+    return meta_get("mosru_last") != now.strftime("%Y-%m")
+
+
+async def mosru_loop():
+    """В назначенный день: auto = отправить сразу, confirm = спросить кнопкой (напоминание раз в сутки)."""
+    last_attempt = 0.0
+    while True:
+        try:
+            now_dt = datetime.now()
+            if mosru_due(now_dt):
+                if MOSRU_MODE == "auto" and time.time() - last_attempt >= 3600:
+                    last_attempt = time.time()
+                    try:
+                        status = await get_status()
+                        record_readings(status)
+                        await mosru_do_submit(neptun_values(status), from_auto=True)
+                    except Exception as e:
+                        log.warning("mos.ru auto: %s", e)
+                        await raise_alert("mosru_submit", "📤 mos.ru: не удалось передать показания.\n" + mosru_error_text(e), repeat=86400)
+                elif MOSRU_MODE == "confirm":
+                    prompted = float(meta_get("mosru_prompt_ts") or 0)
+                    if time.time() - prompted >= 86400:
+                        meta_set("mosru_prompt_ts", str(time.time()))
+                        await mosru_prompt(CHAT_ID)
+        except Exception:
+            log.exception("mosru_loop")
+        await asyncio.sleep(600)
+
+
+async def mosru_keepalive_loop():
+    """Раз в 45 минут трогаем портал, чтобы сессия не протухла между отправками (как в HA-интеграции)."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            if MOSRU_MODE != "off":
+                if mosru_svc.has_session():
+                    try:
+                        await asyncio.to_thread(mosru_svc.get_info)
+                        await clear_alert("mosru_auth", "✅ Сессия mos.ru активна.")
+                    except mosru.NeedLogin:
+                        await raise_alert("mosru_auth", "🔑 Сессия mos.ru истекла. Выполните /mosru_login, иначе показания не уйдут.", repeat=86400)
+                    except (mosru.NeedSetup, MosRuTemporaryError, MosRuApiError) as e:
+                        log.warning("mos.ru keepalive: %s", e)
+                elif meta_get("mosru_user_place_id"):
+                    await raise_alert("mosru_auth", "🔑 Сессия mos.ru недоступна. Выполните /mosru_login.", repeat=86400)
+        except Exception:
+            log.exception("mosru_keepalive")
+        await asyncio.sleep(45 * 60)
+
+
 # --- служебное -------------------------------------------------------------
 class UpdateLogger(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -713,6 +1108,8 @@ fallback = Router()
 
 @fallback.message()
 async def unknown_chat(m: Message):
+    if m.chat.id == CHAT_ID:
+        return  # владелец написал что-то, для чего нет обработчика
     log.warning(
         "Сообщение из чужого чата: chat.id=%s chat.type=%s user.id=%s (ожидался %s)",
         m.chat.id, m.chat.type, m.from_user.id if m.from_user else None, CHAT_ID,
@@ -729,6 +1126,8 @@ async def main():
         meta_set("started_at", str(time.time()))
     asyncio.create_task(local_loop())
     asyncio.create_task(daily_loop())
+    asyncio.create_task(mosru_loop())
+    asyncio.create_task(mosru_keepalive_loop())
     asyncio.create_task(monthly_loop())
     await dp.start_polling(bot)
 
