@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -357,7 +358,15 @@ def _make_device(version, key):
     return d
 
 
+_local_lock = threading.Lock()
+
+
 def _local_status_sync():
+    with _local_lock:  # устройство часто принимает одно соединение: опрос и диагностика не должны пересекаться
+        return _local_status_locked()
+
+
+def _local_status_locked():
     key = _get_local_key_sync()
     if _local["dev"] is None:
         if _local["version"]:
@@ -366,7 +375,7 @@ def _local_status_sync():
             versions = [LOCAL_VERSION]
         else:
             versions = ["3.4", "3.3", "3.5", "3.2"]
-        last = None
+        errors = []
         for v in versions:
             d = _make_device(v, key)
             res = d.status()
@@ -374,13 +383,59 @@ def _local_status_sync():
                 _local.update(dev=d, version=v)
                 log.info("Локальное подключение: %s, протокол %s", LOCAL_IP, v)
                 return res["dps"]
-            last = res
-        raise RuntimeError(f"локальный опрос не удался: {last}")
+            errors.append(f"{v}: {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+        raise RuntimeError("локальный опрос не удался: " + "; ".join(errors))
     res = _local["dev"].status()
     if not res or "dps" not in res:
         _local["dev"] = None
         raise RuntimeError(f"локальный опрос не удался: {res}")
     return res["dps"]
+
+
+def _lan_diag_sync():
+    """Пошаговая проверка связи с устройством по локальной сети."""
+    out = []
+    if not LOCAL_IP:
+        return ["TUYA_LOCAL_IP не задан в .env"]
+    with _local_lock:
+        # 1. TCP до порта Tuya
+        try:
+            sock = socket.create_connection((LOCAL_IP, 6668), timeout=5)
+            sock.close()
+            out.append(f"1) TCP {LOCAL_IP}:6668: ✅ порт открыт")
+        except OSError as e:
+            out.append(f"1) TCP {LOCAL_IP}:6668: ❌ {e}")
+            out.append("Устройство не отвечает по сети: проверьте IP в роутере, что устройство и бот в одной подсети, "
+                       "что модуль не в режиме сна/выключен, и что другое приложение не держит соединение.")
+            return out
+        # 2. ключ
+        try:
+            key = _get_local_key_sync()
+            out.append(f"2) local key: {'из .env' if LOCAL_KEY_ENV else 'из облака'}, длина {len(key)} (должно быть 16)")
+        except Exception as e:
+            out.append(f"2) local key: ❌ {e}")
+            return out
+        # 3. все версии протокола
+        working = []
+        for v in ("3.5", "3.4", "3.3", "3.2", "3.1"):
+            try:
+                res = _make_device(v, key).status()
+            except Exception as e:
+                res = {"Error": str(e), "Err": "exc"}
+            if res and "dps" in res:
+                working.append(v)
+                out.append(f"3) версия {v}: ✅ ответ получен, DP: {len(res['dps'])}")
+            else:
+                out.append(f"3) версия {v}: ❌ {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+        if working:
+            _local.update(dev=None, version=working[0])
+            out.append(f"Итог: подходит версия {working[0]}. Бот переключился на неё. "
+                       f"Чтобы закрепить, добавьте в .env: TUYA_LOCAL_VERSION={working[0]}")
+        else:
+            out.append("Итог: ни одна версия не ответила, хотя порт открыт. Скорее всего, неверный local key "
+                       "(ключ меняется при переподключении устройства в Smart Life). Получите свежий: "
+                       "`python -m tinytuya wizard`, впишите в TUYA_LOCAL_KEY и пересоздайте контейнер.")
+    return out
 
 
 def to_codes(dps):
@@ -569,6 +624,17 @@ async def raw(m: Message):
     except Exception as e:
         log.exception("raw")
         await m.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("lan"))
+async def lan_cmd(m: Message):
+    await m.answer("Проверяю связь с устройством по локальной сети, это займёт до минуты…")
+    try:
+        lines = await asyncio.to_thread(_lan_diag_sync)
+    except Exception as e:
+        log.exception("lan")
+        lines = [f"Ошибка диагностики: {e}"]
+    await answer_long(m, "🔎 Диагностика LAN\n" + "\n".join(lines))
 
 
 @dp.message(Command("diag"))
