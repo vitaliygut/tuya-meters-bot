@@ -32,6 +32,7 @@ from aiogram.types import (
 )
 
 import mosru
+import neptun_modbus as nm
 from mosru_api import MosRuApiError, MosRuAuthError, MosRuTemporaryError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -58,6 +59,17 @@ LOCAL_POLL_INTERVAL = int(os.environ.get("LOCAL_POLL_INTERVAL", "15"))
 OFFLINE_ALERT_MINUTES = float(os.environ.get("OFFLINE_ALERT_MINUTES", "10"))
 ALERT_REPEAT_HOURS = float(os.environ.get("ALERT_REPEAT_HOURS", "24"))
 LEAK_REPEAT_MINUTES = float(os.environ.get("LEAK_REPEAT_MINUTES", "30"))
+# Локальный Modbus Neptun Smart (порт 503): протечка, краны, датчики и счётчики за секунды, без облака
+MODBUS_ENABLED = os.environ.get("MODBUS_ENABLED", "false").lower() == "true"
+MODBUS_HOST = os.environ.get("MODBUS_HOST", "").strip() or LOCAL_IP
+MODBUS_PORT = int(os.environ.get("MODBUS_PORT", "503"))
+MODBUS_UNIT = int(os.environ.get("MODBUS_UNIT", "240"))  # заводской адрес модуля
+MODBUS_POLL_INTERVAL = int(os.environ.get("MODBUS_POLL_INTERVAL", "10"))
+MODBUS_FRAMING = os.environ.get("MODBUS_FRAMING", "auto").strip().lower()  # auto | tcp | rtu
+
+# Контроль протечки/кранов через облако для DP, которых нет в локальном ответе (1 вызов API за опрос).
+# 300 с = ~8600 вызовов в месяц. 0 = выключено (тогда DP протечки должны приходить локально)
+LEAK_CLOUD_INTERVAL = int(os.environ.get("LEAK_CLOUD_INTERVAL", "300"))
 
 # автоматическое снятие показаний раз в сутки (облако, 1 вызов API в день)
 DAILY_READ_HOUR = int(os.environ.get("DAILY_READ_HOUR", "8"))  # час по TZ, -1 = выключено
@@ -506,6 +518,12 @@ def _lan_probe_dps(key, variant):
                 d.close()
             except Exception:
                 pass
+        rev = {v: k for k, v in mapping.items()}
+        shown = []
+        for k, v in sorted(seen.items(), key=lambda kv: str(kv[0])):
+            text = f"{len(v)} симв." if isinstance(v, str) and len(v) > 24 else fmt_val(v)
+            shown.append(f"{rev.get(str(k), str(k))}[{k}]={text}")
+        out.append("   пришли: " + "; ".join(shown))
         codes = to_codes(seen)
         got = [c for c in watch_codes if c in codes]
         out.append(f"6) после updatedps пришло DP: {len(seen)}; из LEAK_WATCH получены: {', '.join(got) or 'ни одного'}")
@@ -624,6 +642,18 @@ def fmt_health():
             lines.append(f"Ошибка: {str(local_state['error'])[:200]}")
     else:
         lines.append("Связь по LAN: ожидание первого ответа")
+    if MODBUS_ENABLED:
+        if modbus_healthy():
+            lines.append(f"Modbus ({MODBUS_HOST}:{MODBUS_PORT}): 🟢 опрос каждые {MODBUS_POLL_INTERVAL} с, протокол {modbus_state['framing']}")
+        elif modbus_state["fail_since"]:
+            lines.append(f"Modbus: 🔴 нет ответа уже {fmt_dur(time.time() - modbus_state['fail_since'])}: {str(modbus_state['error'])[:150]}")
+        else:
+            lines.append("Modbus: ожидание первого ответа")
+    if modbus_healthy():
+        leak_src = "локально по Modbus (облако не используется)"
+    else:
+        leak_src = f"через облако каждые {fmt_dur(LEAK_CLOUD_INTERVAL)}" if LEAK_CLOUD_INTERVAL > 0 else "только локально"
+    lines.append(f"Контроль протечки и кранов: {leak_src}")
     if MONTHLY_REPORT_DAY:
         lines.append(f"Ежемесячный отчёт: {MONTHLY_REPORT_DAY} числа в {MONTHLY_REPORT_HOUR:02d}:00")
     if MOSRU_MODE != "off":
@@ -800,6 +830,161 @@ async def local_loop():
                 except Exception:
                     log.exception("обновление local_key")
         await asyncio.sleep(LOCAL_POLL_INTERVAL)
+
+
+async def leak_cloud_loop():
+    """Запасной контроль протечки/кранов через облако для DP, которых нет в локальном ответе."""
+    if LEAK_CLOUD_INTERVAL <= 0:
+        return
+    await asyncio.sleep(30)
+    while True:
+        try:
+            if modbus_healthy():
+                await asyncio.sleep(LEAK_CLOUD_INTERVAL)  # протечку контролирует Modbus, вызовы API экономим
+                continue
+            status = await get_status()
+            record_readings(status)  # заодно свежие показания: тревога «нет данных» следит за ними
+            local_codes = to_codes(local_state["dps"] or {}) if local_state["ts"] and not local_state["fail_since"] else {}
+            await check_leaks({c: v for c, v in status.items() if c not in local_codes})
+        except Exception as e:
+            log.warning("Облачный контроль протечки: %s", e)
+        await asyncio.sleep(LEAK_CLOUD_INTERVAL)
+
+
+# --- Modbus (локальная сеть, порт 503) ----------------------------------------------
+modbus_state = {"ts": None, "snap": None, "framing": None, "fail_since": None, "error": None, "ever_ok": False}
+_modbus_lock = threading.Lock()
+
+
+def modbus_healthy():
+    return bool(
+        MODBUS_ENABLED
+        and modbus_state["ts"]
+        and not modbus_state["fail_since"]
+        and time.time() - modbus_state["ts"] < MODBUS_POLL_INTERVAL * 3 + 10
+    )
+
+
+def _modbus_read_sync():
+    with _modbus_lock:
+        framing = modbus_state["framing"] or MODBUS_FRAMING
+        return nm.read_snapshot(MODBUS_HOST, MODBUS_PORT, MODBUS_UNIT, framing)
+
+
+def _modbus_diag_sync():
+    out = []
+    if not MODBUS_HOST:
+        return ["Не задан адрес: укажите TUYA_LOCAL_IP или MODBUS_HOST в .env"]
+    with _modbus_lock:
+        try:
+            socket.create_connection((MODBUS_HOST, MODBUS_PORT), timeout=5).close()
+            out.append(f"1) TCP {MODBUS_HOST}:{MODBUS_PORT}: ✅ порт открыт")
+        except OSError as e:
+            out.append(f"1) TCP {MODBUS_HOST}:{MODBUS_PORT}: ❌ {e}")
+            out.append("Модуль не отдаёт Modbus по этому порту. Возможные причины: в вашей версии прошивки (Tuya) "
+                       "он отключён, либо порт занят другим клиентом (SST Cloud, Home Assistant, другое приложение).")
+            return out
+        snap = None
+        for framing in ("tcp", "rtu"):
+            try:
+                snap, _ = nm.read_snapshot(MODBUS_HOST, MODBUS_PORT, MODBUS_UNIT, framing)
+                out.append(f"2) Modbus {framing.upper()}, адрес {MODBUS_UNIT}: ✅ ответ получен")
+                modbus_state["framing"] = framing
+                break
+            except Exception as e:
+                out.append(f"2) Modbus {framing.upper()}, адрес {MODBUS_UNIT}: ❌ {e}")
+        if not snap:
+            out.append("Порт открыт, но регистры не читаются. Проверьте адрес модуля (MODBUS_UNIT, заводской 240; "
+                       "он есть в DP address_modbus) и что другой клиент не держит соединение.")
+            return out
+    yn = lambda v: "да" if v else "нет"
+    out.append(f"3) Тревога группы 1: {yn(snap['alarm_g1'])}; группы 2: {yn(snap['alarm_g2'])}")
+    out.append(f"   Краны группы 1: {'открыты' if snap['valves_g1_open'] else 'ЗАКРЫТЫ'}"
+               + (f"; группы 2: {'открыты' if snap['valves_g2_open'] else 'ЗАКРЫТЫ'}" if snap["two_groups"] else ""))
+    out.append("   Проводные линии в тревоге: " + (", ".join(str(i + 1) for i, a in enumerate(snap["wired_alarm"]) if a) or "нет"))
+    out.append(f"   Режим мойки пола: {yn(snap['floor_cleaning'])}; батареи разряжены: {yn(snap['battery_low'])}; "
+               f"датчики потеряны: {yn(snap['sensor_lost'])}")
+    out.append(f"   Беспроводных датчиков: {len(snap['rf'])}"
+               + "".join(f"\n   • №{r['n']}: батарея {r['battery']}%, сигнал {r['signal']}"
+                         + (", ТРЕВОГА" if r["alarm"] else "") + (", потерян" if r["lost"] else "") for r in snap["rf"]))
+    local = to_codes(local_state["dps"] or {})
+    for i in (6, 7):
+        name = f"counter{i + 1}"
+        line = f"4) {name}: Modbus {snap['counters'][i]}"
+        if name in local:
+            line += f", Tuya {local[name]} " + ("✅ совпадает" if local[name] == snap["counters"][i] else "⚠️ отличается")
+        out.append(line)
+    out.append("Если значения счётчиков совпали, Modbus можно включить: MODBUS_ENABLED=true.")
+    return out
+
+
+@dp.message(Command("modbus"))
+async def modbus_cmd(m: Message):
+    await m.answer("Проверяю Modbus на порту %s…" % MODBUS_PORT)
+    try:
+        lines = await asyncio.to_thread(_modbus_diag_sync)
+    except Exception as e:
+        log.exception("modbus")
+        lines = [f"Ошибка диагностики: {e}"]
+    await answer_long(m, "🔎 Диагностика Modbus\n" + "\n".join(lines))
+
+
+async def _flag(key, active, on_text, off_text, repeat=None):
+    if active:
+        await raise_alert(key, on_text, repeat=repeat)
+    else:
+        await clear_alert(key, off_text)
+
+
+async def check_modbus(snap):
+    leak = LEAK_REPEAT_MINUTES * 60
+    groups = [(1, snap["alarm_g1"], snap["valves_g1_open"])]
+    if snap["two_groups"]:
+        groups.append((2, snap["alarm_g2"], snap["valves_g2_open"]))
+    for n, alarm, open_ in groups:
+        await _flag(f"mb:alarm_g{n}", alarm, f"🚨 ПРОТЕЧКА: тревога по группе {n} Neptun!\nПроверьте датчики и краны.",
+                    f"✅ Тревога по группе {n} снята.", leak)
+        await _flag(f"mb:closed_g{n}", not open_, f"🔒 Краны группы {n} закрыты.", f"🔓 Краны группы {n} открыты.")
+    for i, active in enumerate(snap["wired_alarm"]):
+        await _flag(f"mb:wired{i + 1}", active, f"🚨 Проводной датчик {i + 1}: тревога (протечка)!",
+                    f"✅ Проводной датчик {i + 1}: тревога снята.", leak)
+    for r in snap["rf"]:
+        await _flag(f"mb:rf{r['n']}", r["alarm"], f"🚨 Беспроводной датчик №{r['n']}: тревога (протечка)! Батарея {r['battery']}%.",
+                    f"✅ Беспроводной датчик №{r['n']}: тревога снята.", leak)
+    lost = [str(r["n"]) for r in snap["rf"] if r["lost"]]
+    low = [str(r["n"]) for r in snap["rf"] if r["discharged"]]
+    await _flag("mb:lost", snap["sensor_lost"] or bool(lost),
+                "⚠️ Потеряна связь с беспроводными датчиками" + (f": №{', №'.join(lost)}" if lost else "") + ".",
+                "✅ Связь с датчиками восстановлена.")
+    await _flag("mb:battery", snap["battery_low"] or bool(low),
+                "🔋 Разряжены батареи датчиков" + (f": №{', №'.join(low)}" if low else "") + ".",
+                "✅ Батареи датчиков в норме.")
+
+
+async def modbus_loop():
+    if not MODBUS_ENABLED:
+        return
+    if not MODBUS_HOST:
+        log.warning("MODBUS_ENABLED=true, но не задан адрес (TUYA_LOCAL_IP или MODBUS_HOST)")
+        return
+    while True:
+        now_ts = time.time()
+        try:
+            snap, framing = await asyncio.to_thread(_modbus_read_sync)
+            modbus_state.update(ts=now_ts, snap=snap, framing=framing, error=None, ever_ok=True)
+            if modbus_state["fail_since"] is not None:
+                modbus_state["fail_since"] = None
+                await clear_alert("mb_offline", "🟢 Связь с Neptun по Modbus восстановлена.")
+            await check_modbus(snap)
+        except Exception as e:
+            log.warning("Modbus: %s", e)
+            modbus_state["error"] = str(e)
+            if modbus_state["fail_since"] is None:
+                modbus_state["fail_since"] = now_ts
+            down = now_ts - modbus_state["fail_since"]
+            if modbus_state["ever_ok"] and down >= OFFLINE_ALERT_MINUTES * 60:
+                await raise_alert("mb_offline", f"🔴 Нет связи с Neptun по Modbus уже {fmt_dur(down)}. Контроль протечки не работает!")
+        await asyncio.sleep(MODBUS_POLL_INTERVAL)
 
 
 # --- ежемесячный отчёт (облако, 1 вызов в месяц) -----------------------------
@@ -1285,6 +1470,8 @@ async def main():
     if not meta_get("started_at"):
         meta_set("started_at", str(time.time()))
     asyncio.create_task(local_loop())
+    asyncio.create_task(modbus_loop())
+    asyncio.create_task(leak_cloud_loop())
     asyncio.create_task(daily_loop())
     asyncio.create_task(mosru_loop())
     asyncio.create_task(mosru_keepalive_loop())
