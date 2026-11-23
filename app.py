@@ -1,15 +1,17 @@
 """
 tuya-meters-bot
 
-Показания счётчиков воды Neptun через облачный Tuya API (кнопка, ежедневный автосъём, ежемесячный отчёт)
-и передача показаний на mos.ru.
+Показания счётчиков воды Neptun (кнопка, ежедневный автосъём, ежемесячный отчёт) и передача на mos.ru.
+Источник показаний на выбор (READ_SOURCE): cloud (Tuya API), local (локальная сеть, tinytuya) или auto.
 """
 import asyncio
+import base64
 import calendar
 import io
 import json
 import logging
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -37,8 +39,8 @@ log = logging.getLogger("tuya-bot")
 
 # --- настройки ---------------------------------------------------------
 REGION = os.environ.get("TUYA_REGION", "eu")
-API_ID = os.environ["TUYA_ACCESS_ID"]
-API_SECRET = os.environ["TUYA_ACCESS_SECRET"]
+API_ID = os.environ.get("TUYA_ACCESS_ID", "").strip()
+API_SECRET = os.environ.get("TUYA_ACCESS_SECRET", "").strip()
 DEVICE_ID = os.environ["TUYA_DEVICE_ID"]
 
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -49,6 +51,21 @@ DB_PATH = os.environ.get("DB_PATH", "/data/bot.db")
 API_MONTHLY_LIMIT = int(os.environ.get("API_MONTHLY_LIMIT", "26000"))  # только для отображения
 
 ALERT_REPEAT_HOURS = float(os.environ.get("ALERT_REPEAT_HOURS", "24"))  # напоминание о нерешённой проблеме
+
+# Откуда брать показания: cloud (Tuya API) | local (локальная сеть) | auto (локально, при сбое облако)
+READ_SOURCE = os.environ.get("READ_SOURCE", "cloud").strip().lower()
+LOCAL_IP = os.environ.get("TUYA_LOCAL_IP", "").strip()
+LOCAL_KEY_ENV = os.environ.get("TUYA_LOCAL_KEY", "").strip()  # пусто = взять из облака один раз
+LOCAL_VERSION = os.environ.get("TUYA_LOCAL_VERSION", "auto").strip()  # auto | 3.3 | 3.4 | 3.5
+LOCAL_RETRIES = int(os.environ.get("LOCAL_RETRIES", "3"))  # попыток на один запрос
+if READ_SOURCE not in ("cloud", "local", "auto"):
+    raise SystemExit("READ_SOURCE должен быть cloud, local или auto")
+if READ_SOURCE in ("local", "auto") and not LOCAL_IP:
+    raise SystemExit(f"READ_SOURCE={READ_SOURCE} требует TUYA_LOCAL_IP")
+if READ_SOURCE in ("cloud", "auto") and not (API_ID and API_SECRET):
+    raise SystemExit(f"READ_SOURCE={READ_SOURCE} требует TUYA_ACCESS_ID и TUYA_ACCESS_SECRET")
+if READ_SOURCE == "local" and not (LOCAL_KEY_ENV or (API_ID and API_SECRET)):
+    raise SystemExit("READ_SOURCE=local требует TUYA_LOCAL_KEY (либо ключи облака, чтобы получить его один раз)")
 
 # автоматическое снятие показаний раз в сутки (облако, 1 вызов API в день)
 DAILY_READ_HOUR = int(os.environ.get("DAILY_READ_HOUR", "8"))  # час по TZ, -1 = выключено
@@ -170,12 +187,14 @@ mosru_svc = mosru.MosRuService(
 )
 
 # --- облако Tuya: показания ----------------------------------------------
-cloud = tinytuya.Cloud(apiRegion=REGION, apiKey=API_ID, apiSecret=API_SECRET, apiDeviceID=DEVICE_ID)
+cloud = tinytuya.Cloud(apiRegion=REGION, apiKey=API_ID, apiSecret=API_SECRET, apiDeviceID=DEVICE_ID) if API_ID and API_SECRET else None
 _cloud_lock = threading.Lock()
 
 
 def cloud_get(url):
     """Любой запрос к облаку: под замком и со счётчиком вызовов."""
+    if cloud is None:
+        raise RuntimeError("Облако Tuya не настроено (TUYA_ACCESS_ID / TUYA_ACCESS_SECRET)")
     with _cloud_lock:
         count_api_call()
         return cloud.cloudrequest(url)
@@ -223,8 +242,146 @@ def _get_status_sync():
     return {}
 
 
+# --- локальная сеть (tinytuya): показания без облака ---------------------------------------
+_local = {"version": None}
+_local_lock = threading.Lock()
+read_state = {"source": None, "ts": None, "error": None, "version": None}
+
+
+def decode_counters(blob):
+    """counters_data (base64): записи по 8 байт, значение счётчика в литрах = байты 2..4 (big-endian).
+    Сверено с облачными counter7/counter8 Neptun Smart. Возвращает {} если это не такой блок."""
+    try:
+        raw = base64.b64decode(blob, validate=True)
+    except Exception:
+        return {}
+    if len(raw) < 16 or len(raw) % 8:
+        return {}
+    return {f"counter{i + 1}": int.from_bytes(raw[i * 8 + 2 : i * 8 + 5], "big") for i in range(len(raw) // 8)}
+
+
+def _extract_counters(dps):
+    for value in dps.values():
+        if isinstance(value, str) and len(value) >= 20:
+            counters = decode_counters(value)
+            if counters:
+                return counters
+    return {}
+
+
+def _local_key_sync():
+    key = LOCAL_KEY_ENV or meta_get("local_key")
+    if key:
+        return key
+    res = cloud_get(f"/v1.0/devices/{DEVICE_ID}")  # один раз, дальше ключ хранится в базе
+    key = ((res or {}).get("result") or {}).get("local_key") if res and res.get("success") else None
+    if not key:
+        raise RuntimeError(f"не удалось получить local_key из облака: {res}")
+    meta_set("local_key", key)
+    return key
+
+
+def _make_device(version, key):
+    d = tinytuya.Device(DEVICE_ID, LOCAL_IP, key, version=float(version))
+    for name, arg in (("set_socketTimeout", 5), ("set_socketRetryLimit", 1)):
+        try:
+            getattr(d, name)(arg)
+        except Exception:
+            pass
+    return d
+
+
+def _local_variants():
+    if _local["version"]:
+        return [_local["version"]]
+    return ["3.4", "3.3", "3.5", "3.2"] if LOCAL_VERSION == "auto" else [LOCAL_VERSION]
+
+
+def _local_status_sync():
+    """Читает счётчики по локальной сети. Возвращает {counter1..counterN, dp_<id>: значение}."""
+    with _local_lock:  # устройство обычно принимает одно соединение за раз
+        key = _local_key_sync()
+        errors = []
+        for attempt in range(max(LOCAL_RETRIES, 1)):
+            for version in _local_variants():
+                res = _make_device(version, key).status()
+                dps = (res or {}).get("dps")
+                if dps:
+                    counters = _extract_counters(dps)
+                    if counters:
+                        _local["version"] = version
+                        out = dict(counters)
+                        out.update({f"dp_{k}": v for k, v in dps.items() if not isinstance(v, str) or len(v) < 20})
+                        return out
+                    errors.append(f"{version}: в ответе нет блока счётчиков (DP: {', '.join(map(str, dps))})")
+                else:
+                    errors.append(f"{version}: {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+            if attempt + 1 < LOCAL_RETRIES:
+                time.sleep(1)
+        _local["version"] = None  # в следующий раз версию определим заново
+        raise RuntimeError("локальный опрос не удался: " + "; ".join(errors[-4:]))
+
+
+def _lan_diag_sync():
+    out = []
+    if not LOCAL_IP:
+        return ["TUYA_LOCAL_IP не задан в .env"]
+    with _local_lock:
+        try:
+            socket.create_connection((LOCAL_IP, 6668), timeout=5).close()
+            out.append(f"1) TCP {LOCAL_IP}:6668: ✅ порт открыт")
+        except OSError as e:
+            return out + [f"1) TCP {LOCAL_IP}:6668: ❌ {e}",
+                          "Проверьте IP в роутере, что бот и устройство в одной сети, что модуль включён "
+                          "и что приложение Smart Life не держит локальное соединение."]
+        try:
+            key = _local_key_sync()
+            out.append(f"2) local key: {'из .env' if LOCAL_KEY_ENV else 'из базы/облака'}, длина {len(key)} (должно быть 16)")
+            if len(key) != 16:
+                out.append("⚠️ Если в ключе есть $, в .env берите значение в одинарные кавычки: TUYA_LOCAL_KEY='abc$def'")
+        except Exception as e:
+            return out + [f"2) local key: ❌ {e}"]
+        found = None
+        for version in ("3.4", "3.3", "3.5", "3.2", "3.1"):
+            try:
+                res = _make_device(version, key).status()
+            except Exception as e:
+                res = {"Error": str(e), "Err": "exc"}
+            dps = (res or {}).get("dps")
+            if dps:
+                counters = _extract_counters(dps)
+                out.append(f"3) версия {version}: ✅ DP: {len(dps)}, блок счётчиков: {'есть' if counters else 'нет'}")
+                if counters and not found:
+                    found = (version, counters)
+            else:
+                out.append(f"3) версия {version}: ❌ {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+        if found:
+            _local["version"] = found[0]
+            c = found[1]
+            out.append("4) " + ", ".join(f"counter{i}={c[f'counter{i}']}" for i in range(1, len(c) + 1) if c.get(f"counter{i}")))
+            out.append(f"Итог: работает версия {found[0]}. Закрепите: TUYA_LOCAL_VERSION={found[0]}")
+        else:
+            out.append("Итог: данные счётчиков не получены. Проверьте ключ (шаг 2) и версию протокола.")
+    return out
+
+
 async def get_status():
-    return await asyncio.to_thread(_get_status_sync)
+    """Показания из выбранного источника (READ_SOURCE). В режиме auto: локально, при сбое облако."""
+    if READ_SOURCE in ("local", "auto"):
+        try:
+            status = await asyncio.to_thread(_local_status_sync)
+            read_state.update(source="local", ts=time.time(), error=None, version=_local["version"])
+            return status
+        except Exception as e:
+            read_state["error"] = str(e)
+            if READ_SOURCE == "local":
+                raise
+            log.warning("Локальный опрос не удался, берём из облака: %s", e)
+    status = await asyncio.to_thread(_get_status_sync)
+    read_state.update(source="cloud", ts=time.time(), version=None)
+    if READ_SOURCE == "cloud":
+        read_state["error"] = None
+    return status
 
 
 SECRET_KEYS = {"local_key", "uid", "ip", "lat", "lon", "owner_id", "sn", "uuid", "mac", "time_zone"}
@@ -328,6 +485,15 @@ def fmt_monthly(status, prev, prev_date, now):
 
 def fmt_health():
     lines = ["🩺 Состояние"]
+    names = {"cloud": "облако Tuya (API)", "local": "локальная сеть", "auto": "локальная сеть, при сбое облако"}
+    src = f"Источник показаний: {names[READ_SOURCE]}"
+    if READ_SOURCE != "cloud":
+        src += f" ({LOCAL_IP}" + (f", протокол {_local['version']}" if _local["version"] else "") + ")"
+    lines.append(src)
+    if read_state["source"] and read_state["ts"]:
+        lines.append(f"Последнее чтение: {'локально' if read_state['source'] == 'local' else 'из облака'}, {fmt_ts(read_state['ts'])}")
+    if READ_SOURCE != "cloud" and read_state["error"]:
+        lines.append(f"Последняя ошибка локального опроса: {str(read_state['error'])[:160]}")
     last_ok = meta_get("last_ok_ts")
     lines.append(f"Последние показания: {fmt_ts(float(last_ok)) if last_ok else 'ещё не снимались'}")
     if SENSORS and DAILY_READ_HOUR >= 0:
@@ -413,10 +579,22 @@ async def health_cmd(m: Message):
 async def raw(m: Message):
     try:
         data = await get_status()
-        await answer_long(m, "🔧 Все DP (облако):\n" + json.dumps(data, ensure_ascii=False, indent=2))
+        where = "локально, без API" if read_state["source"] == "local" else "облако"
+        await answer_long(m, f"🔧 Все DP ({where}):\n" + json.dumps(data, ensure_ascii=False, indent=2))
     except Exception as e:
         log.exception("raw")
         await m.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("lan"))
+async def lan_cmd(m: Message):
+    await m.answer("Проверяю связь с устройством по локальной сети, это займёт до минуты…")
+    try:
+        lines = await asyncio.to_thread(_lan_diag_sync)
+    except Exception as e:
+        log.exception("lan")
+        lines = [f"Ошибка диагностики: {e}"]
+    await answer_long(m, "🔎 Диагностика LAN\n" + "\n".join(lines))
 
 
 @dp.message(Command("diag"))
