@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import socket
 import sqlite3
 import threading
@@ -243,7 +244,7 @@ def _get_status_sync():
 
 
 # --- локальная сеть (tinytuya): показания без облака ---------------------------------------
-_local = {"version": None}
+_local = {"version": None, "key_check": 0.0}
 _local_lock = threading.Lock()
 read_state = {"source": None, "ts": None, "error": None, "version": None}
 
@@ -269,25 +270,62 @@ def _extract_counters(dps):
     return {}
 
 
-def _local_key_sync():
-    key = LOCAL_KEY_ENV or meta_get("local_key")
-    if key:
-        return key
-    res = cloud_get(f"/v1.0/devices/{DEVICE_ID}")  # один раз, дальше ключ хранится в базе
+# Локальные номера DP Neptun Smart -> коды (порядок как в облачном списке, сверен с локальным дампом:
+# значения 101, 108-113, 115-119, 123-144 совпали; 114, 120-122, 145 приходят только при изменении).
+NEPTUN_LOCAL_DPS = {
+    "101": "floor_cleaning_flag", "108": "add_new_sensors", "109": "status_crane_group_1",
+    "110": "status_crane_group_2", "111": "group_eneble", "112": "close_if_sensor_loss",
+    "113": "child_protection", "114": "line_settings", "115": "status_wire_line",
+    "116": "relay_settings", "117": "address_modbus", "118": "modbus_speed", "119": "count_rf_sensors",
+    "120": "settings_rf_sensors", "121": "status_rf_sensor", "122": "counters_data", "123": "notifications",
+    "124": "name_rf_1_5", "125": "name_rf_6_10", "126": "name_rf_11_15", "127": "name_rf_16_20",
+    "128": "name_rf_20_25", "129": "name_rf_26_30", "130": "name_rf_31_35", "131": "name_rf_36_40",
+    "132": "name_rf_40_45", "133": "name_rf_46_50", "134": "name_lines", "135": "name_zones",
+    "136": "name_of_counters", "145": "slots_map",
+}
+NEPTUN_LOCAL_DPS.update({str(136 + n): f"counter{n}" for n in range(1, 9)})  # 137..144 = counter1..counter8
+
+
+def _to_codes(dps):
+    return {NEPTUN_LOCAL_DPS.get(str(k), f"dp_{k}"): v for k, v in dps.items()}
+
+
+def _counters_from(dps):
+    """Счётчики из отдельных DP (137-144); если их нет, пробуем расшифровать блок counters_data."""
+    counters = {c: v for c, v in _to_codes(dps).items() if re.fullmatch(r"counter\d+", c) and isinstance(v, (int, float))}
+    return counters or _extract_counters(dps)
+
+
+def _cloud_local_key_sync():
+    """Актуальный local key из облака (1 вызов API)."""
+    res = cloud_get(f"/v1.0/devices/{DEVICE_ID}")
     key = ((res or {}).get("result") or {}).get("local_key") if res and res.get("success") else None
     if not key:
         raise RuntimeError(f"не удалось получить local_key из облака: {res}")
+    return key
+
+
+def _local_key_sync():
+    """Приоритет: ключ, подтверждённый облаком (после смены) > TUYA_LOCAL_KEY из .env > сохранённый > облако."""
+    key = meta_get("local_key_override") or LOCAL_KEY_ENV or meta_get("local_key")
+    if key:
+        return key
+    key = _cloud_local_key_sync()
     meta_set("local_key", key)
     return key
 
 
 def _make_device(version, key):
-    d = tinytuya.Device(DEVICE_ID, LOCAL_IP, key, version=float(version))
+    """Как в проверенном скрипте: disabledetect=True (иначе для 22-символьного ID tinytuya
+    переключается на device22 и получает ошибки) и версия протокола задаётся явно."""
+    d = tinytuya.Device(DEVICE_ID, LOCAL_IP, key)
     for name, arg in (("set_socketTimeout", 5), ("set_socketRetryLimit", 1)):
         try:
             getattr(d, name)(arg)
         except Exception:
             pass
+    d.disabledetect = True
+    d.set_version(float(version))
     return d
 
 
@@ -297,29 +335,79 @@ def _local_variants():
     return ["3.4", "3.3", "3.5", "3.2"] if LOCAL_VERSION == "auto" else [LOCAL_VERSION]
 
 
+def _local_attempt(key):
+    """Несколько попыток чтения. Возвращает ({код: значение}, список ошибок) или (None, ошибки)."""
+    errors = []
+    for attempt in range(max(LOCAL_RETRIES, 1)):
+        for version in _local_variants():
+            device = _make_device(version, key)
+            try:
+                res = device.status()
+            finally:
+                try:
+                    device.close()
+                except Exception:
+                    pass
+            dps = (res or {}).get("dps")
+            if dps:
+                counters = _counters_from(dps)
+                if counters:
+                    _local["version"] = version
+                    out = {c: v for c, v in _to_codes(dps).items() if not c.startswith("name_")}
+                    out.update(counters)
+                    return out, errors
+                errors.append(f"{version}: в ответе нет счётчиков (DP: {', '.join(map(str, dps))})")
+            else:
+                errors.append(f"{version}: {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+        if attempt + 1 < LOCAL_RETRIES:
+            time.sleep(1)
+    return None, errors
+
+
 def _local_status_sync():
     """Читает счётчики по локальной сети. Возвращает {counter1..counterN, dp_<id>: значение}."""
     with _local_lock:  # устройство обычно принимает одно соединение за раз
         key = _local_key_sync()
-        errors = []
-        for attempt in range(max(LOCAL_RETRIES, 1)):
-            for version in _local_variants():
-                res = _make_device(version, key).status()
-                dps = (res or {}).get("dps")
-                if dps:
-                    counters = _extract_counters(dps)
-                    if counters:
-                        _local["version"] = version
-                        out = dict(counters)
-                        out.update({f"dp_{k}": v for k, v in dps.items() if not isinstance(v, str) or len(v) < 20})
-                        return out
-                    errors.append(f"{version}: в ответе нет блока счётчиков (DP: {', '.join(map(str, dps))})")
-                else:
-                    errors.append(f"{version}: {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
-            if attempt + 1 < LOCAL_RETRIES:
-                time.sleep(1)
+        status, errors = _local_attempt(key)
+        if status:
+            return status
+        # Err 914 = не подошёл ключ или версия. Если устройство переподключали, ключ сменился: сверяем с облаком
+        if any("Err 914" in e for e in errors) and cloud is not None and time.time() - _local["key_check"] > 3600:
+            _local["key_check"] = time.time()
+            try:
+                fresh = _cloud_local_key_sync()
+            except Exception as e:
+                errors.append(f"сверка ключа с облаком: {e}")
+            else:
+                if fresh != key:
+                    meta_set("local_key_override", fresh)
+                    meta_set("local_key", fresh)
+                    log.info("Local key обновлён из облака (прежний не подошёл)")
+                    status, more = _local_attempt(fresh)
+                    if status:
+                        return status
+                    errors += more
         _local["version"] = None  # в следующий раз версию определим заново
         raise RuntimeError("локальный опрос не удался: " + "; ".join(errors[-4:]))
+
+
+def _lan_try_versions(key, out):
+    """Пробует версии протокола с данным ключом. Возвращает (версия, счётчики) или None."""
+    found = None
+    for version in ("3.4", "3.3", "3.5", "3.2", "3.1"):
+        try:
+            res = _make_device(version, key).status()
+        except Exception as e:
+            res = {"Error": str(e), "Err": "exc"}
+        dps = (res or {}).get("dps")
+        if dps:
+            counters = _counters_from(dps)
+            out.append(f"   версия {version}: ✅ DP: {len(dps)}, счётчики: {'есть' if counters else 'нет'}")
+            if counters and not found:
+                found = (version, counters)
+        else:
+            out.append(f"   версия {version}: ❌ {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+    return found
 
 
 def _lan_diag_sync():
@@ -336,32 +424,38 @@ def _lan_diag_sync():
                           "и что приложение Smart Life не держит локальное соединение."]
         try:
             key = _local_key_sync()
-            out.append(f"2) local key: {'из .env' if LOCAL_KEY_ENV else 'из базы/облака'}, длина {len(key)} (должно быть 16)")
+            src = "подтверждённый облаком" if meta_get("local_key_override") else ("из .env" if LOCAL_KEY_ENV else "из базы/облака")
+            out.append(f"2) local key: {src}, длина {len(key)} (должно быть 16)")
             if len(key) != 16:
                 out.append("⚠️ Если в ключе есть $, в .env берите значение в одинарные кавычки: TUYA_LOCAL_KEY='abc$def'")
         except Exception as e:
             return out + [f"2) local key: ❌ {e}"]
-        found = None
-        for version in ("3.4", "3.3", "3.5", "3.2", "3.1"):
+        out.append("3) проверка версий протокола с этим ключом:")
+        found = _lan_try_versions(key, out)
+        if not found and cloud is not None:
+            # возможно, устройство переподключали и ключ сменился: берём актуальный из облака (1 вызов API)
             try:
-                res = _make_device(version, key).status()
+                fresh = _cloud_local_key_sync()
             except Exception as e:
-                res = {"Error": str(e), "Err": "exc"}
-            dps = (res or {}).get("dps")
-            if dps:
-                counters = _extract_counters(dps)
-                out.append(f"3) версия {version}: ✅ DP: {len(dps)}, блок счётчиков: {'есть' if counters else 'нет'}")
-                if counters and not found:
-                    found = (version, counters)
+                out.append(f"4) ключ из облака: ❌ {e}")
             else:
-                out.append(f"3) версия {version}: ❌ {(res or {}).get('Error')} (Err {(res or {}).get('Err')})")
+                if fresh == key:
+                    out.append("4) ключ из облака совпадает с используемым: дело не в ключе")
+                else:
+                    out.append("4) ключ из облака ОТЛИЧАЕТСЯ от используемого, проверяю его:")
+                    found = _lan_try_versions(fresh, out)
+                    if found:
+                        meta_set("local_key_override", fresh)
+                        meta_set("local_key", fresh)
+                        out.append("✅ Новый ключ подошёл и сохранён. Из .env можно удалить TUYA_LOCAL_KEY.")
         if found:
             _local["version"] = found[0]
             c = found[1]
-            out.append("4) " + ", ".join(f"counter{i}={c[f'counter{i}']}" for i in range(1, len(c) + 1) if c.get(f"counter{i}")))
+            out.append("Счётчики: " + ", ".join(f"counter{i}={c[f'counter{i}']}" for i in range(1, len(c) + 1) if c.get(f"counter{i}")))
             out.append(f"Итог: работает версия {found[0]}. Закрепите: TUYA_LOCAL_VERSION={found[0]}")
         else:
-            out.append("Итог: данные счётчиков не получены. Проверьте ключ (шаг 2) и версию протокола.")
+            out.append("Итог: данные не получены. Если ключ из облака совпал с вашим, закройте приложение Smart Life, "
+                       "выключите и включите питание модуля Neptun на минуту и повторите /lan.")
     return out
 
 
