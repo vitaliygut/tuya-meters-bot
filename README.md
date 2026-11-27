@@ -1,4 +1,4 @@
-# tuya-meters-bot
+# neptun-meters-bot
 
 Telegram-бот для счётчиков воды Neptun (и других устройств Tuya / Smart Life):
 
@@ -182,7 +182,7 @@ SENSORS=counter7:Горячая вода:0.001:м³,counter8:Холодная в
 ## Структура
 
 ```
-tuya-meters-bot/
+neptun-meters-bot/
 ├── app.py                    # бот, снятие показаний, отчёты
 ├── mosru.py                  # передача показаний на mos.ru (обвязка)
 ├── mosru_api.py              # клиент портала из hass-mosru-water (MIT)

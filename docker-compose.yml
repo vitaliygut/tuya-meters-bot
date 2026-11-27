@@ -1,7 +1,7 @@
 services:
-  tuya-meters-bot:
+  neptun-meters-bot:
     build: .
-    container_name: tuya-meters-bot
+    container_name: neptun-meters-bot
     restart: unless-stopped
     env_file: .env
     environment:

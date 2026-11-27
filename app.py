@@ -1,5 +1,5 @@
 """
-tuya-meters-bot
+neptun-meters-bot
 
 Показания счётчиков воды Neptun (кнопка, ежедневный автосъём, ежемесячный отчёт) и передача на mos.ru.
 Источник показаний на выбор (READ_SOURCE): cloud (Tuya API), local (локальная сеть, tinytuya) или auto.
@@ -36,7 +36,7 @@ import mosru
 from mosru_api import MosRuApiError, MosRuAuthError, MosRuTemporaryError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("tuya-bot")
+log = logging.getLogger("neptun-bot")
 
 # --- настройки ---------------------------------------------------------
 REGION = os.environ.get("TUYA_REGION", "eu")
